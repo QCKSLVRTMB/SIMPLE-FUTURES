@@ -56,9 +56,6 @@ def _session() -> requests.Session:
     return s
 
 
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ФЬЮЧЕРСОВ
-# ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_futures() -> pd.DataFrame:
     try:
@@ -90,9 +87,6 @@ def fetch_futures() -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ГО ПО КАТЕГОРИЯМ
-# ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ims() -> pd.DataFrame:
     df = pd.DataFrame()
@@ -309,20 +303,16 @@ sign = 1 if direction == "LONG" else -1
 fmt = f"%.{inst.decimals}f"
 step_ui = float(inst.min_step) if inst.min_step > 0 else 0.01
 
-# SL и TP
 c1, c2 = st.columns(2)
 sl = c1.number_input("Стоп-лосс (SL)", value=None, step=step_ui, format=fmt, placeholder="SL")
 tp = c2.number_input("Тейк-профит (TP)", value=None, step=step_ui, format=fmt, placeholder="TP")
 
-# Количество контрактов в сделке
 qty_total = st.number_input(
     "Количество контрактов в сделке",
     min_value=0, value=0, step=1, format="%d",
-    help="Общее количество контрактов, которое вы планируете взять. "
-         "Если оставить 0 — будет взято из суммы по точкам входа.",
+    help="Общее количество контрактов. Если оставить 0 — возьмётся сумма по точкам входа.",
 )
 
-# Точки входа (до 3)
 st.markdown("**Точки входа (до 3)**")
 entries: list[dict] = []
 for i in range(3):
@@ -342,14 +332,12 @@ for i in range(3):
     if p is not None:
         entries.append({"price": p, "qty": q if q is not None else 0})
 
-# Расчёт средней цены и количества
 with_qty = [e for e in entries if e["qty"] > 0]
 
 if with_qty:
     entries_qty_sum = sum(e["qty"] for e in with_qty)
     avg_entry = sum(e["price"] * e["qty"] for e in with_qty) / entries_qty_sum
 elif entries:
-    # Есть цены, но без количеств — берём первую
     avg_entry = entries[0]["price"]
     entries_qty_sum = 0
     if len(entries) > 1:
@@ -361,7 +349,6 @@ else:
     avg_entry = None
     entries_qty_sum = 0
 
-# Итоговое количество для расчёта
 if qty_total > 0:
     effective_qty = qty_total
     if entries_qty_sum > 0 and qty_total != entries_qty_sum:
@@ -375,14 +362,12 @@ elif entries_qty_sum > 0:
 else:
     effective_qty = 0
 
-# Сводка по средней цене
 if avg_entry is not None:
     parts = [f"Средняя цена входа: **{avg_entry:,.{inst.decimals}f}**"]
     if entries_qty_sum > 0:
         parts.append(f"Всего по точкам: **{entries_qty_sum}** конт.")
     st.info(" · ".join(parts))
 
-# Справка о минимальном TP по требуемому RR
 if avg_entry is not None and sl is not None and avg_entry != sl:
     risk_pts = abs(avg_entry - sl)
     raw_min_tp = avg_entry + sign * risk_pts * required_rr
@@ -430,7 +415,6 @@ st.subheader("3. Результат")
 if not have_prices:
     st.info("Заполните хотя бы одну цену входа, стоп-лосс и тейк-профит для расчёта.")
 elif not have_qty:
-    # Считаем только RR — количества не хватает
     sl_dist = abs(avg_entry - sl)
     tp_dist = abs(tp - avg_entry)
     rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
@@ -480,6 +464,31 @@ else:
             st.success(f"{effective_qty} конт. ≤ рекомендуемых {qty_rec}")
         else:
             st.error(f"{effective_qty} конт. > рекомендуемых {qty_rec}")
+
+        # ─── Сокращение позиции при низком RR ───
+        if have_prices and have_qty and not warnings and rr > 0 and rr < required_rr:
+            ratio = rr / required_rr
+            safe_qty = int(math.floor(qty_rec * ratio))
+            if safe_qty < 1:
+                st.warning(
+                    f"RR = {rr:.2f} при требуемом {required_rr:.1f} — слишком низкий. "
+                    f"Рекомендуется пропустить сделку."
+                )
+            elif effective_qty <= safe_qty:
+                st.info(
+                    f"RR = {rr:.2f} < {required_rr:.1f} "
+                    f"({ratio * 100:.0f}% от плана). "
+                    f"Позиция в пределах безопасного объёма: "
+                    f"{effective_qty} ≤ {safe_qty} конт."
+                )
+            else:
+                new_risk = risk_per_ct * safe_qty
+                st.info(
+                    f"RR = {rr:.2f} < {required_rr:.1f} "
+                    f"({ratio * 100:.0f}% от плана). "
+                    f"Сократите позицию до **{safe_qty}** конт. — "
+                    f"риск снизится с {total_risk:,.0f} ₽ до {new_risk:,.0f} ₽."
+                )
 
     with st.expander("Детали расчёта"):
         st.markdown(
