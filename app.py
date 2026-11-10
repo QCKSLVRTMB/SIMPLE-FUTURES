@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from io import StringIO
 
 import pandas as pd
 import requests
@@ -15,7 +14,7 @@ import streamlit as st
 from requests.adapters import HTTPAdapter, Retry
 
 # ─────────────────────────────────────────────────────────────
-# КОНСТАНТЫ (из core/config.py)
+# КОНСТАНТЫ
 # ─────────────────────────────────────────────────────────────
 ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
 
@@ -37,7 +36,7 @@ IMS_MARGIN_MAP = {
 
 
 # ─────────────────────────────────────────────────────────────
-# HTTP-СЕССИЯ (из core/market.py::_session)
+# HTTP-СЕССИЯ
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
@@ -58,7 +57,7 @@ def _session() -> requests.Session:
 
 
 # ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ФЬЮЧЕРСОВ (из core/market.py::fetch_moex_forts)
+# ЗАГРУЗКА ФЬЮЧЕРСОВ
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_futures() -> pd.DataFrame:
@@ -92,11 +91,10 @@ def fetch_futures() -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ГО ПО КАТЕГОРИЯМ (из core/market.py::fetch_moex_ims)
+# ЗАГРУЗКА ГО ПО КАТЕГОРИЯМ
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ims() -> pd.DataFrame:
-    # 1) пробуем JSON
     df = pd.DataFrame()
     try:
         r = _session().get(f"{ISS}/ims", params={"iss.meta": "off", "format": "json"}, timeout=15)
@@ -106,9 +104,9 @@ def fetch_ims() -> pd.DataFrame:
     except Exception:
         pass
 
-    # 2) fallback: CSV с разделителем "|"
     if df.empty:
         try:
+            from io import StringIO
             r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
             r.raise_for_status()
             df = pd.read_csv(StringIO(r.text), sep="|")
@@ -135,7 +133,7 @@ def fetch_ims() -> pd.DataFrame:
 
 def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) -> pd.DataFrame:
     df = futures.copy()
-    df["GO_LONG"]  = df["INITIALMARGIN"]
+    df["GO_LONG"] = df["INITIALMARGIN"]
     df["GO_SHORT"] = df["INITIALMARGIN"]
 
     cols = IMS_MARGIN_MAP.get(margin_type)
@@ -143,17 +141,16 @@ def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) ->
         col_b, col_s = cols
         if col_b in ims.columns and col_s in ims.columns:
             m = ims.set_index("SECID")
-            df["GO_LONG"]  = df["SECID"].map(m[col_b]).fillna(df["GO_LONG"])
+            df["GO_LONG"] = df["SECID"].map(m[col_b]).fillna(df["GO_LONG"])
             df["GO_SHORT"] = df["SECID"].map(m[col_s]).fillna(df["GO_SHORT"])
 
-    # если в IMS для этой категории пусто — используем INITIALMARGIN
-    df["GO_LONG"]  = df["GO_LONG"].where(df["GO_LONG"]  > 0, df["INITIALMARGIN"])
+    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, df["INITIALMARGIN"])
     df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, df["INITIALMARGIN"])
     return df
 
 
 # ─────────────────────────────────────────────────────────────
-# INSTRUMENT (упрощённый core/calc.py::Instrument)
+# INSTRUMENT
 # ─────────────────────────────────────────────────────────────
 @dataclass(slots=True)
 class Instrument:
@@ -173,6 +170,11 @@ class Instrument:
 
     def margin(self, direction: str) -> float:
         return self.go_long if direction == "LONG" else self.go_short
+
+    def round_price(self, p: float) -> float:
+        if not self.min_step:
+            return round(p, self.decimals)
+        return round(round(p / self.min_step) * self.min_step, self.decimals)
 
 
 def _decimals(step: float) -> int:
@@ -262,8 +264,6 @@ if futures.empty:
     st.stop()
 
 futures = merge_margins(futures, ims, margin_type)
-
-# Оставляем ликвидные контракты с валидными данными
 futures = futures[
     (futures["PRICE"] > 0)
     & ((futures["GO_LONG"] > 0) | (futures["GO_SHORT"] > 0))
@@ -304,66 +304,122 @@ st.caption(f"1 пункт = {inst.point_value:.4f} ₽ · Экспирация: 
 st.subheader("2. Сделка")
 
 direction = st.radio("Направление", ["LONG", "SHORT"], horizontal=True)
+sign = 1 if direction == "LONG" else -1
 
 fmt = f"%.{inst.decimals}f"
 step_ui = float(inst.min_step) if inst.min_step > 0 else 0.01
-base = inst.price if inst.price > 0 else 100_000.0
 
-c1, c2, c3 = st.columns(3)
-entry = c1.number_input("Цена входа", value=base, step=step_ui, format=fmt)
-sl = c2.number_input(
-    "Стоп-лосс",
-    value=round(base * 0.99, inst.decimals),
-    step=step_ui,
-    format=fmt,
+# SL и TP
+c1, c2 = st.columns(2)
+sl = c1.number_input("Стоп-лосс (SL)", value=None, step=step_ui, format=fmt, placeholder="SL")
+tp = c2.number_input("Тейк-профит (TP)", value=None, step=step_ui, format=fmt, placeholder="TP")
+
+# Количество контрактов в сделке
+qty_total = st.number_input(
+    "Количество контрактов в сделке",
+    min_value=0, value=0, step=1, format="%d",
+    help="Общее количество контрактов, которое вы планируете взять. "
+         "Если оставить 0 — будет взято из суммы по точкам входа.",
 )
-tp = c3.number_input(
-    "Тейк-профит",
-    value=round(base * 1.03, inst.decimals),
-    step=step_ui,
-    format=fmt,
-)
+
+# Точки входа (до 3)
+st.markdown("**Точки входа (до 3)**")
+entries: list[dict] = []
+for i in range(3):
+    ec1, ec2 = st.columns([2, 1])
+    p = ec1.number_input(
+        f"Цена входа {i + 1}",
+        value=None, step=step_ui, format=fmt,
+        placeholder="—",
+        key=f"entry_p_{i}",
+    )
+    q = ec2.number_input(
+        f"Контрактов {i + 1}",
+        min_value=0, value=None, step=1, format="%d",
+        placeholder="0",
+        key=f"entry_q_{i}",
+    )
+    if p is not None:
+        entries.append({"price": p, "qty": q if q is not None else 0})
+
+# Расчёт средней цены и количества
+with_qty = [e for e in entries if e["qty"] > 0]
+
+if with_qty:
+    entries_qty_sum = sum(e["qty"] for e in with_qty)
+    avg_entry = sum(e["price"] * e["qty"] for e in with_qty) / entries_qty_sum
+elif entries:
+    # Есть цены, но без количеств — берём первую
+    avg_entry = entries[0]["price"]
+    entries_qty_sum = 0
+    if len(entries) > 1:
+        st.warning(
+            "Заполнено несколько цен входа без количества. "
+            "Укажите контракты по каждой точке, чтобы рассчитать среднюю цену."
+        )
+else:
+    avg_entry = None
+    entries_qty_sum = 0
+
+# Итоговое количество для расчёта
+if qty_total > 0:
+    effective_qty = qty_total
+    if entries_qty_sum > 0 and qty_total != entries_qty_sum:
+        st.warning(
+            f"Сумма контрактов по точкам входа ({entries_qty_sum}) "
+            f"не совпадает с общим количеством в сделке ({qty_total}). "
+            "Средняя цена рассчитана только по точкам с указанным количеством."
+        )
+elif entries_qty_sum > 0:
+    effective_qty = entries_qty_sum
+else:
+    effective_qty = 0
+
+# Сводка по средней цене
+if avg_entry is not None:
+    parts = [f"Средняя цена входа: **{avg_entry:,.{inst.decimals}f}**"]
+    if entries_qty_sum > 0:
+        parts.append(f"Всего по точкам: **{entries_qty_sum}** конт.")
+    st.info(" · ".join(parts))
+
+# Справка о минимальном TP по требуемому RR
+if avg_entry is not None and sl is not None and avg_entry != sl:
+    risk_pts = abs(avg_entry - sl)
+    raw_min_tp = avg_entry + sign * risk_pts * required_rr
+    min_tp = inst.round_price(raw_min_tp)
+    st.info(
+        f"Минимальный TP для RR = 1 : {required_rr:.1f} → "
+        f"**{min_tp:,.{inst.decimals}f}** "
+        f"(риск {risk_pts:,.{inst.decimals}f} пт × {required_rr:.1f} = "
+        f"{risk_pts * required_rr:,.{inst.decimals}f} пт)"
+    )
+elif avg_entry is not None and sl is None:
+    st.caption("Введите стоп-лосс — покажу минимальный TP для заданного RR.")
+elif avg_entry is None:
+    st.caption("Введите цену входа — покажу минимальный TP для заданного RR.")
 
 
 # ─────────────────────────────────────────────────────────────
 # ВАЛИДАЦИЯ
 # ─────────────────────────────────────────────────────────────
+have_prices = avg_entry is not None and sl is not None and tp is not None
+have_qty = effective_qty > 0
 warnings: list[str] = []
-if direction == "LONG":
-    if sl >= entry:
-        warnings.append("LONG: стоп-лосс должен быть ниже цены входа.")
-    if tp <= entry:
-        warnings.append("LONG: тейк-профит должен быть выше цены входа.")
-else:
-    if sl <= entry:
-        warnings.append("SHORT: стоп-лосс должен быть выше цены входа.")
-    if tp >= entry:
-        warnings.append("SHORT: тейк-профит должен быть ниже цены входа.")
+
+if have_prices:
+    if direction == "LONG":
+        if sl >= avg_entry:
+            warnings.append("LONG: стоп-лосс должен быть ниже средней цены входа.")
+        if tp <= avg_entry:
+            warnings.append("LONG: тейк-профит должен быть выше средней цены входа.")
+    else:
+        if sl <= avg_entry:
+            warnings.append("SHORT: стоп-лосс должен быть выше средней цены входа.")
+        if tp >= avg_entry:
+            warnings.append("SHORT: тейк-профит должен быть ниже средней цены входа.")
+
 for w in warnings:
     st.warning(w)
-
-
-# ─────────────────────────────────────────────────────────────
-# РАСЧЁТЫ
-# ─────────────────────────────────────────────────────────────
-sl_dist = abs(entry - sl)
-tp_dist = abs(tp - entry)
-
-sl_steps = sl_dist / inst.min_step
-tp_steps = tp_dist / inst.min_step
-risk_per_ct = sl_steps * inst.step_price
-profit_per_ct = tp_steps * inst.step_price
-
-margin = inst.margin(direction)
-risk_budget = deposit * risk_pct / 100
-
-qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
-qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
-qty_rec = min(qty_by_risk, qty_by_margin)
-
-rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-rr_ok = (rr >= required_rr) and (sl_dist > 0) and (tp_dist > 0)
-mm_ok = (qty_rec >= 1) and not warnings
 
 
 # ─────────────────────────────────────────────────────────────
@@ -371,32 +427,66 @@ mm_ok = (qty_rec >= 1) and not warnings
 # ─────────────────────────────────────────────────────────────
 st.subheader("3. Результат")
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Расчётный RR", f"{rr:.2f}")
-m2.metric("Риск на 1 контракт", f"{risk_per_ct:,.0f} ₽")
-m3.metric("Рекомендуемый объём", f"{qty_rec} конт.")
+if not have_prices:
+    st.info("Заполните хотя бы одну цену входа, стоп-лосс и тейк-профит для расчёта.")
+elif not have_qty:
+    # Считаем только RR — количества не хватает
+    sl_dist = abs(avg_entry - sl)
+    tp_dist = abs(tp - avg_entry)
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+    st.metric("Расчётный RR", f"{rr:.2f}")
+    st.info("Укажите количество контрактов в сделке для расчёта риска, сайзинга и MM.")
+else:
+    sl_dist = abs(avg_entry - sl)
+    tp_dist = abs(tp - avg_entry)
 
-col_rr, col_mm = st.columns(2)
-with col_rr:
-    st.markdown("**Проверка RR**")
-    if rr_ok:
-        st.success(f"RR = {rr:.2f} ≥ {required_rr:.1f}")
-    else:
-        st.error(f"RR = {rr:.2f} < {required_rr:.1f}")
+    sl_steps = sl_dist / inst.min_step
+    tp_steps = tp_dist / inst.min_step
+    risk_per_ct = sl_steps * inst.step_price
+    profit_per_ct = tp_steps * inst.step_price
 
-with col_mm:
-    st.markdown("**Проверка MM**")
-    if mm_ok:
-        st.success(f"Помещается {qty_rec} конт.")
-    elif warnings:
-        st.error("Некорректные цены сделки (см. предупреждения).")
-    else:
-        st.error("Ни один контракт не помещается по риску или ГО.")
+    margin = inst.margin(direction)
+    risk_budget = deposit * risk_pct / 100
 
+    qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
+    qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
+    qty_rec = min(qty_by_risk, qty_by_margin)
 
-with st.expander("Детали расчёта"):
-    st.markdown(
-        f"""
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+    total_risk = risk_per_ct * effective_qty
+    total_reward = profit_per_ct * effective_qty
+
+    rr_ok = (rr >= required_rr) and (sl_dist > 0) and (tp_dist > 0)
+    mm_ok = (effective_qty <= qty_rec) and not warnings and effective_qty > 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Расчётный RR", f"{rr:.2f}")
+    m2.metric("Риск на 1 контракт", f"{risk_per_ct:,.0f} ₽")
+    m3.metric("Рекомендуемый объём", f"{qty_rec} конт.")
+
+    col_rr, col_mm = st.columns(2)
+    with col_rr:
+        st.markdown("**Проверка RR**")
+        if rr_ok:
+            st.success(f"RR = {rr:.2f} ≥ {required_rr:.1f}")
+        else:
+            st.error(f"RR = {rr:.2f} < {required_rr:.1f}")
+
+    with col_mm:
+        st.markdown("**Проверка MM**")
+        if warnings:
+            st.error("Некорректные цены сделки (см. предупреждения).")
+        elif mm_ok:
+            st.success(f"{effective_qty} конт. ≤ рекомендуемых {qty_rec}")
+        else:
+            st.error(f"{effective_qty} конт. > рекомендуемых {qty_rec}")
+
+    with st.expander("Детали расчёта"):
+        st.markdown(
+            f"""
+**Взвешенная цена входа:** `{avg_entry:,.{inst.decimals}f}`
+**Количество контрактов:** `{effective_qty}`
+
 **SL:** `{sl_dist:,.{inst.decimals}f}` пт = `{sl_steps:.2f}` шагов × `{inst.step_price:g}` ₽ = **{risk_per_ct:,.2f} ₽ / контракт**
 
 **TP:** `{tp_dist:,.{inst.decimals}f}` пт = `{tp_steps:.2f}` шагов × `{inst.step_price:g}` ₽ = **{profit_per_ct:,.2f} ₽ / контракт**
@@ -409,12 +499,12 @@ with st.expander("Детали расчёта"):
 
 **Рекомендуемый объём:** `min({qty_by_risk}, {qty_by_margin})` = **{qty_rec} конт.**
 
-**При {qty_rec} конт.:**
-- Прибыль при TP: **{profit_per_ct * qty_rec:,.0f} ₽**
-- Убыток при SL: **{risk_per_ct * qty_rec:,.0f} ₽**
-- Фактический риск: **{(risk_per_ct * qty_rec) / deposit * 100 if deposit else 0:.2f}%** от депозита
+**Сделка на {effective_qty} конт.:**
+- Прибыль при TP: **{total_reward:,.0f} ₽**
+- Убыток при SL: **{total_risk:,.0f} ₽**
+- Фактический риск: **{(total_risk) / deposit * 100 if deposit else 0:.2f}%** от депозита
 """
-    )
+        )
 
 st.divider()
 st.caption(
