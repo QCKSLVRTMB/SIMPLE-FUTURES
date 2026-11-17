@@ -1,5 +1,5 @@
 """
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Session State Fixed).
+Калькулятор фьючерсов MOEX — Strict Mobile Version (Zone Risk A-B Added).
 Загружает ВСЕ фьючерсы и точные значения ГО из MOEX ISS.
 Зависимости: streamlit, pandas, requests.
 """
@@ -43,6 +43,7 @@ TRADE_STATE_KEYS = [
     "entry_p_0", "entry_q_0",
     "entry_p_1", "entry_q_1",
     "entry_p_2", "entry_q_2",
+    "point_a_input", "point_b_input",
 ]
 
 
@@ -70,6 +71,44 @@ def fmt_date(s) -> str:
         return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
     except Exception:
         return str(s) if s else "—"
+
+
+# ─────────────────────────────────────────────────────────────
+# ЗОНЫ РИСКА A-B
+# ─────────────────────────────────────────────────────────────
+def determine_zone(entry_price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
+    """
+    Определяет зону входа (1, 2, 3) на основе точек A и B.
+    Зона 1 всегда у точки A, зона 3 всегда у точки B.
+    Возвращает (zone_number, zone_boundaries) или (None, None).
+    """
+    if entry_price is None or a is None or b is None or a == b:
+        return None, None
+    
+    step = (b - a) / 3
+    
+    # Зона 1: от A до A + step (в направлении к B)
+    z1_low = min(a, a + step)
+    z1_high = max(a, a + step)
+    
+    # Зона 2: от A + step до A + 2*step
+    z2_low = min(a + step, a + 2 * step)
+    z2_high = max(a + step, a + 2 * step)
+    
+    # Зона 3: от A + 2*step до B
+    z3_low = min(a + 2 * step, b)
+    z3_high = max(a + 2 * step, b)
+    
+    boundaries = (z1_low, z1_high, z2_low, z2_high, z3_low, z3_high)
+    
+    if z1_low <= entry_price <= z1_high:
+        return 1, boundaries
+    elif z2_low <= entry_price <= z2_high:
+        return 2, boundaries
+    elif z3_low <= entry_price <= z3_high:
+        return 3, boundaries
+    else:
+        return None, None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -119,7 +158,6 @@ def fetch_futures() -> pd.DataFrame:
 def fetch_ims() -> pd.DataFrame:
     """Загружает точные значения ГО из таблицы клиринга MOEX ISS."""
     
-    # Попытка 1: Запрос в формате JSON
     try:
         r = _session().get(f"{ISS}/ims.json", params={"iss.meta": "off"}, timeout=15)
         r.raise_for_status()
@@ -139,7 +177,6 @@ def fetch_ims() -> pd.DataFrame:
     except Exception:
         pass
 
-    # Попытка 2: Запрос в формате CSV (fallback)
     try:
         r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
         r.raise_for_status()
@@ -298,6 +335,15 @@ st.markdown(
     .compact-metrics .item { text-align: center; flex: 1; }
     .compact-metrics .item b { display: block; font-size: 0.7rem; color: #666; text-transform: uppercase; }
     .compact-metrics .item span { font-size: 0.95rem; font-weight: 600; color: #0e1117; }
+    
+    /* Зональный индикатор */
+    .zone-indicator {
+        padding: 8px 12px; border-radius: 6px; margin: 8px 0;
+        font-size: 0.85rem; font-weight: 600;
+    }
+    .zone-1 { background: #e6f4ea; border: 1px solid #34a853; color: #137333; }
+    .zone-2 { background: #fef7e0; border: 1px solid #f9ab00; color: #b06000; }
+    .zone-3 { background: #fce8e6; border: 1px solid #ea4335; color: #c5221f; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -327,6 +373,30 @@ with st.sidebar:
         index=MARGIN_LEVELS.index("КСУР"),
         format_func=lambda x: MARGIN_HINTS.get(x, x),
     )
+    
+    st.divider()
+    
+    st.header("Зоны риска A-B")
+    st.markdown("Диапазон делится на 3 зоны. Зона 1 (у A) — идеальна, зона 2 — повышенный риск, зона 3 (у B) — запрещена.")
+    
+    point_a = st.number_input(
+        "Точка A", 
+        value=None, 
+        step=1.0, 
+        format="%.2f", 
+        placeholder="Цена точки A",
+        key="point_a_input"
+    )
+    point_b = st.number_input(
+        "Точка B", 
+        value=None, 
+        step=1.0, 
+        format="%.2f", 
+        placeholder="Цена точки B",
+        key="point_b_input"
+    )
+    
+    st.caption("LONG: A снизу, B сверху. SHORT: A сверху, B снизу.")
     
     st.divider()
     if st.button("Обновить котировки", use_container_width=True):
@@ -373,7 +443,6 @@ ticker = st.selectbox(
 if "last_ticker" not in st.session_state:
     st.session_state.last_ticker = ticker
 elif st.session_state.last_ticker != ticker:
-    # Сбрасываем все поля сделки при смене фьючерса
     for key in TRADE_STATE_KEYS:
         if key in st.session_state:
             del st.session_state[key]
@@ -453,6 +522,25 @@ have_prices = avg_entry is not None and sl is not None and tp is not None
 have_qty = effective_qty > 0
 warnings = []
 
+# Проверка зон риска A-B
+zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
+zone_blocked = False
+zone_reduction = 1.0
+zone_message = None
+
+if zone is not None and point_a is not None and point_b is not None:
+    if direction == "LONG" and zone == 3:
+        zone_blocked = True
+        zone_message = f"ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для LONG. Высокий риск."
+    elif direction == "SHORT" and zone == 1:
+        zone_blocked = True
+        zone_message = f"ЗАПРЕЩЕНО: вход в зоне 1 (у точки A) для SHORT. Высокий риск."
+    elif zone == 2:
+        zone_reduction = 0.5
+        zone_message = f"Повышенный риск: зона 2. Рекомендуется сократить объём на 50%."
+    else:
+        zone_message = f"Зона {zone}: оптимальная для {direction}."
+
 if have_prices:
     if direction == "LONG":
         if sl >= avg_entry: warnings.append("SL должен быть ниже цены входа")
@@ -464,9 +552,16 @@ if have_prices:
 for w in warnings:
     st.warning(w)
 
+# Отображение зоны входа
+if zone is not None and zone_message:
+    zone_class = f"zone-{zone}"
+    st.markdown(f'<div class="zone-indicator {zone_class}">{zone_message}</div>', unsafe_allow_html=True)
+
 st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
-if not have_prices:
+if zone_blocked:
+    st.error(zone_message)
+elif not have_prices:
     st.info("Заполните цену входа, SL и TP для расчёта.")
 elif not have_qty:
     sl_dist = abs(avg_entry - sl)
@@ -489,6 +584,9 @@ else:
     qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
     qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
     qty_rec = min(qty_by_risk, qty_by_margin)
+    
+    # Применяем снижение объёма для зоны 2
+    qty_rec = int(qty_rec * zone_reduction)
 
     rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
     total_risk = risk_per_ct * effective_qty
@@ -533,6 +631,17 @@ else:
         risk_color = "#ea4335" if risk_exceeded else "#0e1117"
         risk_style = f"color: {risk_color}; font-weight: 700;" if risk_exceeded else ""
         
+        zone_info = ""
+        if zone is not None and zone_boundaries is not None:
+            z1_low, z1_high, z2_low, z2_high, z3_low, z3_high = zone_boundaries
+            zone_info = f"""
+**Зоны риска A-B:**
+- Зона 1 (идеальная): `{fmt_n(z1_low, inst.decimals)}` — `{fmt_n(z1_high, inst.decimals)}`
+- Зона 2 (повышенный риск): `{fmt_n(z2_low, inst.decimals)}` — `{fmt_n(z2_high, inst.decimals)}`
+- Зона 3 (запрещена): `{fmt_n(z3_low, inst.decimals)}` — `{fmt_n(z3_high, inst.decimals)}`
+- Точка входа в зоне: **{zone}**
+"""
+        
         st.markdown(
             f"""
 **Вход:** `{fmt_n(avg_entry, inst.decimals)}` | **Контрактов:** `{fmt_n(effective_qty, 0)}`
@@ -542,12 +651,14 @@ else:
 
 **Бюджет риска:** `{fmt_n(deposit, 0)} ₽ × {fmt_n(risk_pct, 1)}%` = **{fmt_n(risk_budget, 0)} ₽**
 **Qty по риску:** `{fmt_n(qty_by_risk, 0)} конт.` | **Qty по ГО:** `{fmt_n(qty_by_margin, 0)} конт.`
+{f'**Корректировка зоны:** ×{zone_reduction} (зона 2)' if zone_reduction < 1.0 else ''}
 
 **Итог на {fmt_n(effective_qty, 0)} конт.:**
 - Прибыль при TP: **+{fmt_n(total_reward, 2)} ₽**
 - Убыток при SL: **-{fmt_n(total_risk, 2)} ₽**
 - Фактический риск: <span style="{risk_style}">**{fmt_n(actual_risk_pct, 2)}%** от депозита</span>{' ⚠️ ПРЕВЫШАЕТ УСТАНОВЛЕННЫЙ РИСК' if risk_exceeded else ''}
 
+{zone_info}
 *Источник данных ГО: таблица клиринга MOEX ISS (параметр `{margin_type})*`
 """,
             unsafe_allow_html=True,
