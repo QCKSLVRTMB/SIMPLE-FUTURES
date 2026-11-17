@@ -1,6 +1,6 @@
 """
-Калькулятор фьючерсов MOEX — Ultra-Compact Mobile Version.
-Загружает ВСЕ фьючерсы и ГО из MOEX ISS напрямую.
+Калькулятор фьючерсов MOEX — Ultra-Compact Mobile Version (Fixed Margins).
+Загружает ВСЕ фьючерсы и точные значения ГО из MOEX ISS (таблица ims).
 Зависимости: streamlit, pandas, requests.
 """
 from __future__ import annotations
@@ -23,11 +23,13 @@ ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
 MARGIN_LEVELS = ["НАЧ. ГО", "КНУР", "КСУР", "КПУР", "КОУР"]
 MARGIN_HINTS = {
     "НАЧ. ГО": "НАЧ. ГО — базовое гарантийное обеспечение",
-    "КНУР":    "КНУР — начальный (новичкам)",
-    "КСУР":    "КСУР — стандартный",
-    "КПУР":    "КПУР — повышенный (квалифицированным)",
-    "КОУР":    "КОУР — особый уровень риска",
+    "КНУР":    "КНУР — начальный уровень риска (LRC)",
+    "КСУР":    "КСУР — стандартный уровень риска (MRC)",
+    "КПУР":    "КПУР — повышенный уровень риска (HRC)",
+    "КОУР":    "КОУР — особый уровень риска (ERC)",
 }
+
+# Строгое соответствие колонкам MOEX ISS ims endpoint
 IMS_MARGIN_MAP = {
     "НАЧ. ГО": ("IM_BUY",      "IM_SELL"),
     "КНУР":    ("IM_BUY_LRC",  "IM_SELL_LRC"),
@@ -69,7 +71,7 @@ def fmt_date(s) -> str:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "simple-futures/1.0"})
+    s.headers.update({"User-Agent": "moex-futures-calc/2.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -96,7 +98,7 @@ def fetch_futures() -> pd.DataFrame:
     mkt = mkt.drop_duplicates("SECID", keep="first")
     df = sec.merge(mkt, on="SECID", how="left")
 
-    for col in ("MINSTEP", "STEPPRICE", "INITIALMARGIN", "LAST", "PREVSETTLEPRICE", "BUYSELLFEE", "OPENPOSITION", "LASTCHANGEPRCNT"):
+    for col in ("MINSTEP", "STEPPRICE", "INITIALMARGIN", "LAST", "PREVSETTLEPRICE"):
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
@@ -108,56 +110,55 @@ def fetch_futures() -> pd.DataFrame:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ims() -> pd.DataFrame:
-    df = pd.DataFrame()
+    """Загружает точные значения ГО из таблицы клиринга MOEX ISS."""
     try:
         r = _session().get(f"{ISS}/ims", params={"iss.meta": "off", "format": "json"}, timeout=15)
         r.raise_for_status()
         block = r.json().get("ims") or {}
         df = pd.DataFrame(block.get("data") or [], columns=block.get("columns") or [])
-    except Exception:
-        pass
-
-    if df.empty:
-        try:
-            r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
-            r.raise_for_status()
-            df = pd.read_csv(StringIO(r.text), sep="|")
-            df.columns = [str(c).split("(")[0].strip() for c in df.columns]
-        except Exception:
-            return pd.DataFrame()
-
-    if df.empty:
-        return df
-
-    df.columns = [str(c).upper() for c in df.columns]
-    for c in df.columns:
-        if c.startswith("IM_") and c != "IM_TIME":
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-    if "BOARDID" in df.columns:
-        filtered = df[df["BOARDID"] == "RFUD"]
-        if not filtered.empty:
-            df = filtered
-    if "SECID" in df.columns:
-        df = df.drop_duplicates("SECID", keep="first")
-    return df
+        
+        if not df.empty:
+            df.columns = [str(c).upper().strip() for c in df.columns]
+            # Оставляем только основную срочную доску
+            if "BOARDID" in df.columns:
+                df = df[df["BOARDID"] == "RFUD"].copy()
+            if "SECID" in df.columns:
+                df = df.drop_duplicates("SECID", keep="first").copy()
+                
+            # Приводим колонки IM_* к числовому виду
+            for c in df.columns:
+                if c.startswith("IM_") and c != "IM_TIME":
+                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            return df
+    except Exception as e:
+        st.warning(f"⚠️ Не удалось загрузить точные ГО (IMS). Используются базовые значения. ({e})")
+        
+    return pd.DataFrame()
 
 
 def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) -> pd.DataFrame:
     df = futures.copy()
-    df["GO_LONG"] = df["INITIALMARGIN"]
-    df["GO_SHORT"] = df["INITIALMARGIN"]
+    
+    # Базовое ГО из таблицы securities (как резервный вариант)
+    base_margin = df["INITIALMARGIN"].fillna(0.0)
+    df["GO_LONG"] = base_margin
+    df["GO_SHORT"] = base_margin
 
     cols = IMS_MARGIN_MAP.get(margin_type)
     if cols and not ims.empty and "SECID" in ims.columns:
         col_b, col_s = cols
+        # Строго проверяем наличие нужных колонок в ответе MOEX
         if col_b in ims.columns and col_s in ims.columns:
-            m = ims.set_index("SECID")
-            df["GO_LONG"] = df["SECID"].map(m[col_b]).fillna(df["GO_LONG"])
-            df["GO_SHORT"] = df["SECID"].map(m[col_s]).fillna(df["GO_SHORT"])
+            margin_map = ims.set_index("SECID")
+            
+            # Мапим значения. Если SECID не найден в ims, остаётся base_margin
+            df["GO_LONG"] = df["SECID"].map(margin_map[col_b]).fillna(base_margin)
+            df["GO_SHORT"] = df["SECID"].map(margin_map[col_s]).fillna(base_margin)
 
-    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, df["INITIALMARGIN"])
-    df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, df["INITIALMARGIN"])
+    # Финальная защита: если ГО всё ещё <= 0, принудительно подставляем базовое
+    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, base_margin)
+    df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, base_margin)
+    
     return df
 
 
@@ -225,7 +226,7 @@ st.markdown(
     /* Глобальное сжатие для мобильных */
     @media (max-width: 640px) {
         .block-container { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
-        .stApp > header { display: none; } /* Скрываем стандартный хедер для экономии места */
+        .stApp > header { display: none; } /* Скрываем стандартный хедер приложения */
         
         /* Принудительно держим колонки горизонтально на мобильных */
         .mobile-col-3 > div { width: 33.33% !important; flex: 0 0 33.33% !important; padding: 0 2px !important; }
@@ -242,9 +243,11 @@ st.markdown(
         
         /* Сжатые экспандеры */
         .streamlit-expanderHeader { font-size: 13px !important; padding: 0.3rem 0 !important; }
-        
-        /* Скрываем лишние отступы у кнопок */
         .stButton > button { padding: 0.3rem 0.5rem !important; font-size: 13px !important; }
+        
+        /* Сайдбар на мобильном: делаем заголовки видимыми и читаемыми */
+        .stSidebar h3 { font-size: 1rem !important; margin-bottom: 0.5rem !important; margin-top: 0.5rem !important; }
+        .stSidebar p { font-size: 0.8rem !important; color: #666 !important; margin-bottom: 0.8rem !important; }
     }
     
     /* Кастомный компактный блок метрик */
@@ -254,8 +257,8 @@ st.markdown(
         font-size: 0.85rem; margin-bottom: 8px;
     }
     .compact-metrics .item { text-align: center; flex: 1; }
-    .compact-metrics .item b { display: block; font-size: 0.75rem; color: #666; }
-    .compact-metrics .item span { font-size: 1rem; font-weight: 600; color: #0e1117; }
+    .compact-metrics .item b { display: block; font-size: 0.7rem; color: #666; text-transform: uppercase; }
+    .compact-metrics .item span { font-size: 0.95rem; font-weight: 600; color: #0e1117; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -263,38 +266,48 @@ st.markdown(
 
 
 # ─────────────────────────────────────────────────────────────
-# САЙДБАР
+# САЙДБАР (С ЧЁТКИМИ ЗАГОЛОВКАМИ)
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Параметры счёта")
+    st.markdown("### ⚙️ Параметры счёта")
+    st.markdown("Настройки депозита и допустимого риска для расчёта объёма позиции.")
+    
     deposit = st.number_input("Депозит, ₽", min_value=0.0, value=100_000.0, step=10_000.0, format="%.0f")
     risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
+    
+    st.markdown("---")
+    st.markdown("### 🛡️ Управление риском")
+    
     margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
     required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
     margin_type = st.selectbox(
-        "Категория риска", MARGIN_LEVELS, index=MARGIN_LEVELS.index("КСУР"),
+        "Категория риска (ГО)", 
+        MARGIN_LEVELS, 
+        index=MARGIN_LEVELS.index("КСУР"),
         format_func=lambda x: MARGIN_HINTS.get(x, x),
     )
-    if st.button("🔄 Обновить котировки", use_container_width=True):
+    
+    st.markdown("---")
+    if st.button("🔄 Обновить котировки", use_container_width=True, type="primary"):
         fetch_futures.clear()
         fetch_ims.clear()
         st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА
+# ЗАГРУЗКА ДАННЫХ
 # ─────────────────────────────────────────────────────────────
-# Компактный заголовок
 st.markdown("<h4 style='margin: 0 0 8px 0;'>📊 Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
 
-with st.spinner("Загрузка..."):
+with st.spinner("Загрузка данных MOEX..."):
     futures = fetch_futures()
     ims = fetch_ims()
 
 if futures.empty:
-    st.error("Не удалось загрузить данные MOEX ISS.")
+    st.error("Не удалось загрузить список фьючерсов с MOEX ISS.")
     st.stop()
 
+# Применяем выбранный тип маржи
 futures = merge_margins(futures, ims, margin_type)
 futures = futures[(futures["PRICE"] > 0) & ((futures["GO_LONG"] > 0) | (futures["GO_SHORT"] > 0))].copy()
 
@@ -321,13 +334,13 @@ st.markdown(
     f"""
     <div class="compact-metrics">
         <div class="item"><b>Цена</b><span>{fmt_n(inst.price, inst.decimals)}</span></div>
-        <div class="item"><b>Шаг / Ст</b><span>{fmt_n(inst.min_step, inst.decimals)} / {fmt_n(inst.step_price, 0)}₽</span></div>
-        <div class="item"><b>ГО L / S</b><span>{fmt_n(inst.go_long, 0)} / {fmt_n(inst.go_short, 0)}₽</span></div>
+        <div class="item"><b>Шаг / Ст</b><span>{fmt_n(inst.min_step, inst.decimals)} / {fmt_n(inst.step_price, 2)} ₽</span></div>
+        <div class="item"><b>ГО ({margin_type})</b><span>L: {fmt_n(inst.go_long, 0)} / S: {fmt_n(inst.go_short, 0)} ₽</span></div>
     </div>
     """,
     unsafe_allow_html=True,
 )
-st.caption(f"1 п. = {fmt_n(inst.point_value, 2)} ₽ · Эксп: {fmt_date(inst.expiry)}", help="")
+st.caption(f"1 пункт = {fmt_n(inst.point_value, 2)} ₽ · Экспирация: {fmt_date(inst.expiry)}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -344,7 +357,7 @@ c1, c2 = st.columns(2, gap="small")
 sl = c1.number_input("SL", value=None, step=step_ui, format=fmt_in, placeholder="Стоп-лосс", label_visibility="collapsed")
 tp = c2.number_input("TP", value=None, step=step_ui, format=fmt_in, placeholder="Тейк-профит", label_visibility="collapsed")
 
-# Точки входа: по умолчанию только 1, остальные в экспандере
+# Точки входа: по умолчанию только 1, остальные в экспандере для экономии места
 st.markdown("<div style='font-size: 0.85rem; font-weight: 600; margin: 8px 0 4px 0;'>Точка входа</div>", unsafe_allow_html=True)
 ec1, ec2 = st.columns([3, 2], gap="small")
 p1 = ec1.number_input("Цена 1", value=None, step=step_ui, format=fmt_in, placeholder="Цена входа", label_visibility="collapsed", key="entry_p_0")
@@ -402,7 +415,7 @@ if have_prices:
 for w in warnings:
     st.warning(w, icon="⚠️")
 
-st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True) # Микро-отступ
+st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
 if not have_prices:
     st.info("Заполните цену входа, SL и TP для расчёта.", icon="ℹ️")
@@ -435,7 +448,7 @@ else:
     rr_ok = (rr >= required_rr) and (sl_dist > 0) and (tp_dist > 0)
     mm_ok = (effective_qty <= qty_rec) and not warnings and effective_qty > 0
 
-    # Компактный блок результатов (вместо 3-х st.metric)
+    # Компактный блок результатов
     st.markdown(
         f"""
         <div class="compact-metrics" style="background: #e8f4f8; border: 1px solid #d0e8f2;">
@@ -482,5 +495,7 @@ else:
 - Прибыль при TP: **+{fmt_n(total_reward, 2)} ₽**
 - Убыток при SL: **-{fmt_n(total_risk, 2)} ₽**
 - Фактический риск: **{fmt_n((total_risk) / deposit * 100 if deposit else 0, 2)}%** от депозита
+
+*Источник данных ГО: таблица клиринга MOEX ISS (параметр `{margin_type})*`
 """
         )
