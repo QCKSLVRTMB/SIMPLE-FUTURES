@@ -1,6 +1,6 @@
 """
-Калькулятор фьючерсов MOEX — Ultra-Compact Mobile Version (Fixed Margins).
-Загружает ВСЕ фьючерсы и точные значения ГО из MOEX ISS (таблица ims).
+Калькулятор фьючерсов MOEX — Strict Mobile Version.
+Загружает ВСЕ фьючерсы и точные значения ГО из MOEX ISS.
 Зависимости: streamlit, pandas, requests.
 """
 from __future__ import annotations
@@ -111,29 +111,45 @@ def fetch_futures() -> pd.DataFrame:
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ims() -> pd.DataFrame:
     """Загружает точные значения ГО из таблицы клиринга MOEX ISS."""
+    
+    # Попытка 1: Запрос в формате JSON
     try:
-        r = _session().get(f"{ISS}/ims", params={"iss.meta": "off", "format": "json"}, timeout=15)
+        r = _session().get(f"{ISS}/ims.json", params={"iss.meta": "off"}, timeout=15)
         r.raise_for_status()
-        block = r.json().get("ims") or {}
+        js = r.json()
+        block = js.get("ims") or {}
         df = pd.DataFrame(block.get("data") or [], columns=block.get("columns") or [])
-        
         if not df.empty:
             df.columns = [str(c).upper().strip() for c in df.columns]
-            # Оставляем только основную срочную доску
             if "BOARDID" in df.columns:
                 df = df[df["BOARDID"] == "RFUD"].copy()
             if "SECID" in df.columns:
                 df = df.drop_duplicates("SECID", keep="first").copy()
-                
-            # Приводим колонки IM_* к числовому виду
             for c in df.columns:
                 if c.startswith("IM_") and c != "IM_TIME":
                     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
             return df
-    except Exception as e:
-        st.warning(f"⚠️ Не удалось загрузить точные ГО (IMS). Используются базовые значения. ({e})")
-        
-    return pd.DataFrame()
+    except Exception:
+        pass
+
+    # Попытка 2: Запрос в формате CSV (fallback, если JSON не сработал)
+    try:
+        r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text), sep="|")
+        if not df.empty:
+            df.columns = [str(c).upper().strip() for c in df.columns]
+            if "BOARDID" in df.columns:
+                df = df[df["BOARDID"] == "RFUD"].copy()
+            if "SECID" in df.columns:
+                df = df.drop_duplicates("SECID", keep="first").copy()
+            for c in df.columns:
+                if c.startswith("IM_") and c != "IM_TIME":
+                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            return df
+    except Exception:
+        st.warning("Не удалось загрузить точные ГО. Используются базовые значения.")
+        return pd.DataFrame()
 
 
 def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) -> pd.DataFrame:
@@ -245,7 +261,7 @@ st.markdown(
         .streamlit-expanderHeader { font-size: 13px !important; padding: 0.3rem 0 !important; }
         .stButton > button { padding: 0.3rem 0.5rem !important; font-size: 13px !important; }
         
-        /* Сайдбар на мобильном: делаем заголовки видимыми и читаемыми */
+        /* Сайдбар на мобильном */
         .stSidebar h3 { font-size: 1rem !important; margin-bottom: 0.5rem !important; margin-top: 0.5rem !important; }
         .stSidebar p { font-size: 0.8rem !important; color: #666 !important; margin-bottom: 0.8rem !important; }
     }
@@ -254,7 +270,7 @@ st.markdown(
     .compact-metrics {
         display: flex; justify-content: space-between; align-items: center;
         background: #f0f2f6; padding: 8px 12px; border-radius: 8px;
-        font-size: 0.85rem; margin-bottom: 8px;
+        font-size: 0.85rem; margin-bottom: 8px; border: 1px solid #e0e0e0;
     }
     .compact-metrics .item { text-align: center; flex: 1; }
     .compact-metrics .item b { display: block; font-size: 0.7rem; color: #666; text-transform: uppercase; }
@@ -266,17 +282,18 @@ st.markdown(
 
 
 # ─────────────────────────────────────────────────────────────
-# САЙДБАР (С ЧЁТКИМИ ЗАГОЛОВКАМИ)
+# САЙДБАР
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Параметры счёта")
+    st.header("Параметры счёта")
     st.markdown("Настройки депозита и допустимого риска для расчёта объёма позиции.")
     
     deposit = st.number_input("Депозит, ₽", min_value=0.0, value=100_000.0, step=10_000.0, format="%.0f")
     risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
     
-    st.markdown("---")
-    st.markdown("### 🛡️ Управление риском")
+    st.divider()
+    
+    st.header("Управление риском")
     
     margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
     required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
@@ -287,8 +304,8 @@ with st.sidebar:
         format_func=lambda x: MARGIN_HINTS.get(x, x),
     )
     
-    st.markdown("---")
-    if st.button("🔄 Обновить котировки", use_container_width=True, type="primary"):
+    st.divider()
+    if st.button("Обновить котировки", use_container_width=True):
         fetch_futures.clear()
         fetch_ims.clear()
         st.rerun()
@@ -297,7 +314,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # ЗАГРУЗКА ДАННЫХ
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h4 style='margin: 0 0 8px 0;'>📊 Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
+st.markdown("<h4 style='margin: 0 0 8px 0;'>Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
 
 with st.spinner("Загрузка данных MOEX..."):
     futures = fetch_futures()
@@ -367,7 +384,7 @@ entries = []
 if p1 is not None:
     entries.append({"price": p1, "qty": q1 if q1 is not None else 0})
 
-with st.expander("➕ Добавить усреднение (до 3 точек)", expanded=False):
+with st.expander("Добавить усреднение (до 3 точек)", expanded=False):
     for i in range(1, 3):
         ec1, ec2 = st.columns([3, 2], gap="small")
         p = ec1.number_input(f"Цена {i+1}", value=None, step=step_ui, format=fmt_in, placeholder=f"Цена входа {i+1}", label_visibility="collapsed", key=f"entry_p_{i}")
@@ -394,7 +411,7 @@ if avg_entry is not None and sl is not None and avg_entry != sl:
     risk_pts = abs(avg_entry - sl)
     raw_min_tp = avg_entry + sign * risk_pts * required_rr
     min_tp = inst.round_price(raw_min_tp)
-    st.info(f"Мин. TP для RR 1:{fmt_n(required_rr, 1)} → **{fmt_n(min_tp, inst.decimals)}**", icon="💡")
+    st.info(f"Мин. TP для RR 1:{fmt_n(required_rr, 1)} → **{fmt_n(min_tp, inst.decimals)}**")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -413,12 +430,12 @@ if have_prices:
         if tp >= avg_entry: warnings.append("TP должен быть ниже цены входа")
 
 for w in warnings:
-    st.warning(w, icon="⚠️")
+    st.warning(w)
 
 st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
 if not have_prices:
-    st.info("Заполните цену входа, SL и TP для расчёта.", icon="ℹ️")
+    st.info("Заполните цену входа, SL и TP для расчёта.")
 elif not have_qty:
     sl_dist = abs(avg_entry - sl)
     tp_dist = abs(tp - avg_entry)
@@ -463,24 +480,24 @@ else:
     # Компактные проверки
     if not mm_ok or not rr_ok:
         if warnings:
-            st.error("Некорректные цены сделки", icon="🚫")
+            st.error("Некорректные цены сделки")
         elif effective_qty > qty_rec:
-            st.error(f"Объём {effective_qty} > реком. {qty_rec}", icon="🚫")
+            st.error(f"Объём {effective_qty} > реком. {qty_rec}")
         elif not rr_ok:
             ratio = rr / required_rr
             safe_qty = int(math.floor(qty_rec * ratio))
             if safe_qty < 1:
-                st.warning("RR слишком низкий. Рекомендуется пропустить сделку.", icon="⚠️")
+                st.warning("RR слишком низкий. Рекомендуется пропустить сделку.")
             elif effective_qty <= safe_qty:
-                st.info(f"RR ниже плана, но объём {effective_qty} ≤ безопасного {safe_qty}", icon="⚠️")
+                st.info(f"RR ниже плана, но объём {effective_qty} ≤ безопасного {safe_qty}")
             else:
                 new_risk = risk_per_ct * safe_qty
-                st.warning(f"Сократите до **{safe_qty}** конт. (риск снизится до {fmt_n(new_risk, 0)} ₽)", icon="⚠️")
+                st.warning(f"Сократите до **{safe_qty}** конт. (риск снизится до {fmt_n(new_risk, 0)} ₽)")
     else:
-        st.success(f"Сделка корректна: {effective_qty} конт. ≤ {qty_rec}, RR = {fmt_n(rr, 2)}", icon="✅")
+        st.success(f"Сделка корректна: {effective_qty} конт. ≤ {qty_rec}, RR = {fmt_n(rr, 2)}")
 
     # Детали расчёта в свёрнутом виде
-    with st.expander("📝 Детали расчёта", expanded=False):
+    with st.expander("Детали расчёта", expanded=False):
         st.markdown(
             f"""
 **Вход:** `{fmt_n(avg_entry, inst.decimals)}` | **Контрактов:** `{fmt_n(effective_qty, 0)}`
