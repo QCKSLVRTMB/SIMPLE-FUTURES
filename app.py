@@ -1,5 +1,5 @@
 """
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Deposit Parsing).
+Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Decimal Formatting).
 Автоматически подгружает справочные данные из Google Sheets.
 Зависимости: streamlit, pandas, requests.
 """
@@ -48,16 +48,15 @@ TRADE_STATE_KEYS = [
 
 
 # ─────────────────────────────────────────────────────────────
-# ПАРСИНГ ЧИСЕЛ
+# ПАРСИНГ И ФОРМАТИРОВАНИЕ
 # ─────────────────────────────────────────────────────────────
 def parse_number(val) -> float | None:
-    """Универсальный парсинг чисел из ячеек таблицы (учитывает пробелы, запятые, валюту)."""
+    """Универсальный парсинг чисел из ячеек таблицы."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
     s = str(val).strip()
     if not s or s.lower() == "nan":
         return None
-    # Убираем валютные символы, пробелы, меняем запятую на точку
     s = s.replace("р.", "").replace("руб.", "").replace("₽", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
     try:
         return float(s)
@@ -65,81 +64,16 @@ def parse_number(val) -> float | None:
         return None
 
 
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ ИЗ GOOGLE SHEETS
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_sheet_data() -> tuple[float, dict]:
-    """Загружает депозит из B1 и список всех сетапов (A, B) для тикеров."""
-    default_deposit = 100000.0
-    ticker_map = {}
-    
-    try:
-        df = pd.read_csv(SHEET_URL, header=None)
-        
-        # 1. ДЕПОЗИТ: сначала пробуем напрямую из B1 (строка 0, столбец 1)
-        if len(df) > 0 and len(df.columns) > 1:
-            val = parse_number(df.iloc[0, 1])
-            if val is not None and val > 0:
-                default_deposit = val
-        
-        # 2. Fallback: ищем слово "Депозит" в любом столбце и берем значение справа
-        if default_deposit == 100000.0:
-            for col_idx in range(min(4, len(df.columns))):
-                deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
-                if not deposit_rows.empty:
-                    row_idx = deposit_rows.index[0]
-                    if col_idx + 1 < len(df.columns):
-                        val = parse_number(df.iloc[row_idx, col_idx + 1])
-                        if val is not None and val > 0:
-                            default_deposit = val
-                            break
-        
-        # 3. Поиск таблицы тикеров
-        header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
-        if not header_idx.empty:
-            idx = header_idx[0]
-            data_df = df.iloc[idx+1:].dropna(how='all')
-            data_df.columns = ["Тикер", "Тикер TW", "A", "B"]
-            
-            for _, row in data_df.iterrows():
-                t = str(row["Тикер"]).strip()
-                if t and t.lower() != "nan":
-                    tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
-                    pt_a = parse_number(row["A"])
-                    pt_b = parse_number(row["B"])
-
-                    direction = None
-                    if pt_a is not None and pt_b is not None:
-                        direction = "LONG" if pt_a < pt_b else "SHORT"
-
-                    setup = {"tw": tw_val, "a": pt_a, "b": pt_b, "dir": direction}
-                    
-                    if t not in ticker_map:
-                        ticker_map[t] = []
-                    ticker_map[t].append(setup)
-                    
-    except Exception as e:
-        st.warning(f"Не удалось загрузить данные из Google Sheets: {e}")
-        
-    return default_deposit, ticker_map
-
-
-# ─────────────────────────────────────────────────────────────
-# ФОРМАТИРОВАНИЕ И ЛОГИКА ЗОН
-# ─────────────────────────────────────────────────────────────
 def fmt_n(v, decimals: int = 0) -> str:
+    """Форматирование числа с указанным количеством знаков после запятой."""
     try:
         v = float(v)
     except (TypeError, ValueError):
         return "—"
-    d = max(0, min(int(decimals), 2))
-    if d == 0:
-        s = f"{v:.0f}"
-    else:
-        s = f"{v:.{d}f}"
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
+    d = max(0, min(int(decimals), 6))
+    s = f"{v:.{d}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
     return s.replace(".", ",")
 
 
@@ -173,12 +107,72 @@ def determine_zone(price: float | None, a: float | None, b: float | None) -> tup
 
 
 # ─────────────────────────────────────────────────────────────
+# ЗАГРУЗКА ДАННЫХ ИЗ GOOGLE SHEETS
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sheet_data() -> tuple[float, dict]:
+    """Загружает депозит из B1 и список всех сетапов (A, B) для тикеров."""
+    default_deposit = 100000.0
+    ticker_map = {}
+    
+    try:
+        df = pd.read_csv(SHEET_URL, header=None)
+        
+        # 1. ДЕПОЗИТ из B1
+        if len(df) > 0 and len(df.columns) > 1:
+            val = parse_number(df.iloc[0, 1])
+            if val is not None and val > 0:
+                default_deposit = val
+        
+        # 2. Fallback: поиск слова "Депозит"
+        if default_deposit == 100000.0:
+            for col_idx in range(min(4, len(df.columns))):
+                deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
+                if not deposit_rows.empty:
+                    row_idx = deposit_rows.index[0]
+                    if col_idx + 1 < len(df.columns):
+                        val = parse_number(df.iloc[row_idx, col_idx + 1])
+                        if val is not None and val > 0:
+                            default_deposit = val
+                            break
+        
+        # 3. Таблица тикеров
+        header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
+        if not header_idx.empty:
+            idx = header_idx[0]
+            data_df = df.iloc[idx+1:].dropna(how='all')
+            data_df.columns = ["Тикер", "Тикер TW", "A", "B"]
+            
+            for _, row in data_df.iterrows():
+                t = str(row["Тикер"]).strip()
+                if t and t.lower() != "nan":
+                    tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
+                    pt_a = parse_number(row["A"])
+                    pt_b = parse_number(row["B"])
+
+                    direction = None
+                    if pt_a is not None and pt_b is not None:
+                        direction = "LONG" if pt_a < pt_b else "SHORT"
+
+                    setup = {"tw": tw_val, "a": pt_a, "b": pt_b, "dir": direction}
+                    
+                    if t not in ticker_map:
+                        ticker_map[t] = []
+                    ticker_map[t].append(setup)
+                    
+    except Exception as e:
+        st.warning(f"Не удалось загрузить данные из Google Sheets: {e}")
+        
+    return default_deposit, ticker_map
+
+
+# ─────────────────────────────────────────────────────────────
 # HTTP-СЕССИЯ И MOEX ISS
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/5.0"})
+    s.headers.update({"User-Agent": "moex-futures-calc/6.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -305,7 +299,7 @@ class Instrument:
 def _decimals(step: float) -> int:
     if step <= 0:
         return 2
-    return max(0, min(2, int(math.ceil(-math.log10(step)))))
+    return max(0, min(6, int(math.ceil(-math.log10(step)))))
 
 
 def _to_instrument(row: pd.Series) -> Instrument:
@@ -405,87 +399,13 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────
 sheet_deposit, sheet_ticker_map = load_sheet_data()
 
-# Инициализация депозита из таблицы при первом запуске сессии
 if "deposit_initialized" not in st.session_state:
     st.session_state.deposit_input = sheet_deposit
     st.session_state.deposit_initialized = True
 
 
 # ─────────────────────────────────────────────────────────────
-# САЙДБАР
-# ─────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Депозит и риск на сделку")
-    st.markdown("Основные параметры для расчёта объёма позиции.")
-    
-    deposit = st.number_input(
-        "Депозит, руб.", min_value=0.0, 
-        step=1000.0, format="%.0f", key="deposit_input"
-    )
-    
-    # СПРАВКА ПО ДЕПОЗИТУ ИЗ ТАБЛИЦЫ
-    st.markdown(
-        f"<div class='sidebar-ref'><div class='sidebar-ref-item'>Из таблицы (B1): <b>{fmt_n(sheet_deposit, 0)} руб.</b></div></div>",
-        unsafe_allow_html=True
-    )
-    
-    risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
-    
-    st.divider()
-    
-    st.header("Лимиты загрузки и RR")
-    st.markdown("Контроль нагрузки на депозит и минимальное соотношение риск/прибыль.")
-    
-    margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
-    required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
-    margin_type = st.selectbox(
-        "Категория риска (ГО)", 
-        MARGIN_LEVELS, 
-        index=MARGIN_LEVELS.index("КСУР"),
-        format_func=lambda x: MARGIN_HINTS.get(x, x),
-    )
-    
-    st.divider()
-    
-    st.header("Зоны риска A-B")
-    st.markdown("Введите значения вручную, опираясь на справку ниже.")
-    
-    point_a = st.number_input(
-        "Точка A", value=None, step=1.0, format="%.2f", placeholder="Цена точки A", key="point_a_input"
-    )
-    point_b = st.number_input(
-        "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
-    )
-    
-    # СПРАВОЧНЫЙ БЛОК ИЗ GOOGLE SHEETS
-    st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
-    
-    current_ticker = st.session_state.get("ticker_select", "")
-    setups = sheet_ticker_map.get(current_ticker, [])
-    
-    if setups:
-        ref_html = "<div class='sidebar-ref'>"
-        for s in setups:
-            dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
-            dir_text = s.get("dir") or "N/A"
-            a_text = fmt_n(s["a"]) if s["a"] is not None else "—"
-            b_text = fmt_n(s["b"]) if s["b"] is not None else "—"
-            ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
-        ref_html += "</div>"
-        st.markdown(ref_html, unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='sidebar-ref'><div class='sidebar-ref-item'>Данных для этого тикера нет</div></div>", unsafe_allow_html=True)
-    
-    st.divider()
-    if st.button("Обновить котировки", use_container_width=True):
-        fetch_futures.clear()
-        fetch_ims.clear()
-        load_sheet_data.clear()
-        st.rerun()
-
-
-# ─────────────────────────────────────────────────────────────
-# ОСНОВНОЙ ИНТЕРФЕЙС
+# ОСНОВНОЙ ИНТЕРФЕЙС (ЗАГРУЗКА ДАННЫХ ДО САЙДБАРА)
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h4 style='margin: 0 0 8px 0;'>Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
 
@@ -531,6 +451,83 @@ elif st.session_state.last_ticker != ticker:
 
 inst = instruments[ticker]
 
+
+# ─────────────────────────────────────────────────────────────
+# САЙДБАР (ТЕПЕРЬ ПОСЛЕ ЗАГРУЗКИ inst)
+# ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Депозит и риск на сделку")
+    st.markdown("Основные параметры для расчёта объёма позиции.")
+    
+    deposit = st.number_input(
+        "Депозит, руб.", min_value=0.0, 
+        step=1000.0, format="%.0f", key="deposit_input"
+    )
+    
+    st.markdown(
+        f"<div class='sidebar-ref'><div class='sidebar-ref-item'>Из таблицы (B1): <b>{fmt_n(sheet_deposit, 0)} руб.</b></div></div>",
+        unsafe_allow_html=True
+    )
+    
+    risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
+    
+    st.divider()
+    
+    st.header("Лимиты загрузки и RR")
+    st.markdown("Контроль нагрузки на депозит и минимальное соотношение риск/прибыль.")
+    
+    margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
+    required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
+    margin_type = st.selectbox(
+        "Категория риска (ГО)", 
+        MARGIN_LEVELS, 
+        index=MARGIN_LEVELS.index("КСУР"),
+        format_func=lambda x: MARGIN_HINTS.get(x, x),
+    )
+    
+    st.divider()
+    
+    st.header("Зоны риска A-B")
+    st.markdown("Введите значения вручную, опираясь на справку ниже.")
+    
+    point_a = st.number_input(
+        "Точка A", value=None, step=1.0, format="%.2f", placeholder="Цена точки A", key="point_a_input"
+    )
+    point_b = st.number_input(
+        "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
+    )
+    
+    # СПРАВОЧНЫЙ БЛОК С ТОЧНЫМ ФОРМАТИРОВАНИЕМ
+    st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
+    
+    current_ticker = st.session_state.get("ticker_select", "")
+    setups = sheet_ticker_map.get(current_ticker, [])
+    
+    if setups:
+        ref_html = "<div class='sidebar-ref'>"
+        for s in setups:
+            dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
+            dir_text = s.get("dir") or "N/A"
+            # ИСПОЛЬЗУЕМ inst.decimals ДЛЯ ТОЧНОГО ФОРМАТИРОВАНИЯ
+            a_text = fmt_n(s["a"], inst.decimals) if s["a"] is not None else "—"
+            b_text = fmt_n(s["b"], inst.decimals) if s["b"] is not None else "—"
+            ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
+        ref_html += "</div>"
+        st.markdown(ref_html, unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='sidebar-ref'><div class='sidebar-ref-item'>Данных для этого тикера нет</div></div>", unsafe_allow_html=True)
+    
+    st.divider()
+    if st.button("Обновить котировки", use_container_width=True):
+        fetch_futures.clear()
+        fetch_ims.clear()
+        load_sheet_data.clear()
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────
+# ОСНОВНОЙ ИНТЕРФЕЙС (ПРОДОЛЖЕНИЕ)
+# ─────────────────────────────────────────────────────────────
 st.markdown(
     f"""
     <div class="compact-metrics">
