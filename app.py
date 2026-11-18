@@ -1,5 +1,5 @@
 """
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Decimal Formatting).
+Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Execution Order).
 Автоматически подгружает справочные данные из Google Sheets.
 Зависимости: streamlit, pandas, requests.
 """
@@ -51,7 +51,6 @@ TRADE_STATE_KEYS = [
 # ПАРСИНГ И ФОРМАТИРОВАНИЕ
 # ─────────────────────────────────────────────────────────────
 def parse_number(val) -> float | None:
-    """Универсальный парсинг чисел из ячеек таблицы."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
     s = str(val).strip()
@@ -65,7 +64,6 @@ def parse_number(val) -> float | None:
 
 
 def fmt_n(v, decimals: int = 0) -> str:
-    """Форматирование числа с указанным количеством знаков после запятой."""
     try:
         v = float(v)
     except (TypeError, ValueError):
@@ -111,20 +109,17 @@ def determine_zone(price: float | None, a: float | None, b: float | None) -> tup
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_sheet_data() -> tuple[float, dict]:
-    """Загружает депозит из B1 и список всех сетапов (A, B) для тикеров."""
     default_deposit = 100000.0
     ticker_map = {}
     
     try:
         df = pd.read_csv(SHEET_URL, header=None)
         
-        # 1. ДЕПОЗИТ из B1
         if len(df) > 0 and len(df.columns) > 1:
             val = parse_number(df.iloc[0, 1])
             if val is not None and val > 0:
                 default_deposit = val
         
-        # 2. Fallback: поиск слова "Депозит"
         if default_deposit == 100000.0:
             for col_idx in range(min(4, len(df.columns))):
                 deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
@@ -136,7 +131,6 @@ def load_sheet_data() -> tuple[float, dict]:
                             default_deposit = val
                             break
         
-        # 3. Таблица тикеров
         header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
         if not header_idx.empty:
             idx = header_idx[0]
@@ -172,7 +166,7 @@ def load_sheet_data() -> tuple[float, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/6.0"})
+    s.headers.update({"User-Agent": "moex-futures-calc/7.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -395,7 +389,7 @@ st.markdown(
 
 
 # ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ ИЗ ТАБЛИЦЫ
+# ИНИЦИАЛИЗАЦИЯ SESSION STATE
 # ─────────────────────────────────────────────────────────────
 sheet_deposit, sheet_ticker_map = load_sheet_data()
 
@@ -403,9 +397,12 @@ if "deposit_initialized" not in st.session_state:
     st.session_state.deposit_input = sheet_deposit
     st.session_state.deposit_initialized = True
 
+if "margin_type" not in st.session_state:
+    st.session_state.margin_type = "КСУР"
+
 
 # ─────────────────────────────────────────────────────────────
-# ОСНОВНОЙ ИНТЕРФЕЙС (ЗАГРУЗКА ДАННЫХ ДО САЙДБАРА)
+# ЗАГРУЗКА ДАННЫХ MOEX (ДО САЙДБАРА)
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h4 style='margin: 0 0 8px 0;'>Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
 
@@ -417,6 +414,8 @@ if futures.empty:
     st.error("Не удалось загрузить список фьючерсов с MOEX ISS.")
     st.stop()
 
+# margin_type теперь берется из session_state
+margin_type = st.session_state.margin_type
 futures = merge_margins(futures, ims, margin_type)
 futures = futures[(futures["PRICE"] > 0) & ((futures["GO_LONG"] > 0) | (futures["GO_SHORT"] > 0))].copy()
 
@@ -440,7 +439,6 @@ ticker = st.selectbox(
     key="ticker_select"
 )
 
-# Логика сброса полей при смене тикера
 if "last_ticker" not in st.session_state:
     st.session_state.last_ticker = ticker
 elif st.session_state.last_ticker != ticker:
@@ -453,7 +451,7 @@ inst = instruments[ticker]
 
 
 # ─────────────────────────────────────────────────────────────
-# САЙДБАР (ТЕПЕРЬ ПОСЛЕ ЗАГРУЗКИ inst)
+# САЙДБАР (ПОСЛЕ ЗАГРУЗКИ inst)
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Депозит и риск на сделку")
@@ -478,11 +476,14 @@ with st.sidebar:
     
     margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
     required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
+    
+    # margin_type теперь синхронизируется через session_state
     margin_type = st.selectbox(
         "Категория риска (ГО)", 
         MARGIN_LEVELS, 
-        index=MARGIN_LEVELS.index("КСУР"),
+        index=MARGIN_LEVELS.index(st.session_state.margin_type),
         format_func=lambda x: MARGIN_HINTS.get(x, x),
+        key="margin_type"
     )
     
     st.divider()
@@ -497,7 +498,6 @@ with st.sidebar:
         "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
     )
     
-    # СПРАВОЧНЫЙ БЛОК С ТОЧНЫМ ФОРМАТИРОВАНИЕМ
     st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
     
     current_ticker = st.session_state.get("ticker_select", "")
@@ -508,7 +508,6 @@ with st.sidebar:
         for s in setups:
             dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
             dir_text = s.get("dir") or "N/A"
-            # ИСПОЛЬЗУЕМ inst.decimals ДЛЯ ТОЧНОГО ФОРМАТИРОВАНИЯ
             a_text = fmt_n(s["a"], inst.decimals) if s["a"] is not None else "—"
             b_text = fmt_n(s["b"], inst.decimals) if s["b"] is not None else "—"
             ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
@@ -539,7 +538,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ИНДИКАТОР ТЕКУЩЕЙ ЗОНЫ ЦЕНЫ
 current_zone, _ = determine_zone(inst.price, point_a, point_b)
 if current_zone is not None:
     zone_class = f"zone-{current_zone}"
