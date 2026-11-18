@@ -1,6 +1,6 @@
 """
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Google Sheets Integrated).
-Автоматически подгружает тикеры TW, точки A/B и депозит из Google Sheets.
+Калькулятор фьючерсов MOEX — Strict Mobile Version (Multi-Setup Reference).
+Автоматически подгружает справочные данные из Google Sheets.
 Зависимости: streamlit, pandas, requests.
 """
 from __future__ import annotations
@@ -38,7 +38,6 @@ IMS_MARGIN_MAP = {
     "КОУР":    ("IM_BUY_ERC",  "IM_SELL_ERC"),
 }
 
-# Ключи session_state для полей сделки (сбрасываются при смене тикера)
 TRADE_STATE_KEYS = [
     "sl_input", "tp_input",
     "entry_p_0", "entry_q_0",
@@ -53,25 +52,24 @@ TRADE_STATE_KEYS = [
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_sheet_data() -> tuple[float, dict]:
-    """Загружает депозит и маппинг тикеров из Google Sheets."""
+    """Загружает депозит и список всех сетапов (A, B) для тикеров."""
     default_deposit = 100000.0
-    ticker_map = {}
+    ticker_map = {} # ticker -> list of setups
     
     try:
         df = pd.read_csv(SHEET_URL, header=None)
         
-        # 1. Поиск депозита (ищем слово "Депозит" в первом столбце)
+        # 1. Поиск депозита
         deposit_rows = df[df[0].astype(str).str.contains("Депозит", na=False, case=False)]
         if not deposit_rows.empty:
             val_str = str(deposit_rows.iloc[0, 1])
-            # Очистка формата "р.69 000,00" -> 69000.0
             val_str = val_str.replace("р.", "").replace(" ", "").replace(",", ".").strip()
             try:
                 default_deposit = float(val_str)
             except ValueError:
                 pass
 
-        # 2. Поиск заголовка таблицы тикеров
+        # 2. Поиск таблицы тикеров
         header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
         if not header_idx.empty:
             idx = header_idx[0]
@@ -81,30 +79,27 @@ def load_sheet_data() -> tuple[float, dict]:
             for _, row in data_df.iterrows():
                 t = str(row["Тикер"]).strip()
                 if t and t.lower() != "nan":
-                    # Парсинг точек A и B с заменой запятых на точки
-                    val_a = row["A"]
-                    val_b = row["B"]
+                    tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
                     
-                    pt_a = None
-                    pt_b = None
-                    
-                    if pd.notna(val_a) and str(val_a).strip():
-                        try:
-                            pt_a = float(str(val_a).replace(",", ".").strip())
-                        except ValueError:
-                            pass
-                            
-                    if pd.notna(val_b) and str(val_b).strip():
-                        try:
-                            pt_b = float(str(val_b).replace(",", ".").strip())
-                        except ValueError:
-                            pass
+                    pt_a, pt_b = None, None
+                    if pd.notna(row["A"]) and str(row["A"]).strip():
+                        try: pt_a = float(str(row["A"]).replace(",", ".").strip())
+                        except ValueError: pass
+                    if pd.notna(row["B"]) and str(row["B"]).strip():
+                        try: pt_b = float(str(row["B"]).replace(",", ".").strip())
+                        except ValueError: pass
 
-                    ticker_map[t] = {
-                        "tw": str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else "",
-                        "a": pt_a,
-                        "b": pt_b,
-                    }
+                    # Определяем направление на основе A и B
+                    direction = None
+                    if pt_a is not None and pt_b is not None:
+                        direction = "LONG" if pt_a < pt_b else "SHORT"
+
+                    setup = {"tw": tw_val, "a": pt_a, "b": pt_b, "dir": direction}
+                    
+                    if t not in ticker_map:
+                        ticker_map[t] = []
+                    ticker_map[t].append(setup)
+                    
     except Exception as e:
         st.warning(f"Не удалось загрузить данные из Google Sheets: {e}")
         
@@ -112,7 +107,7 @@ def load_sheet_data() -> tuple[float, dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# ФОРМАТИРОВАНИЕ
+# ФОРМАТИРОВАНИЕ И ЛОГИКА ЗОН
 # ─────────────────────────────────────────────────────────────
 def fmt_n(v, decimals: int = 0) -> str:
     try:
@@ -137,9 +132,9 @@ def fmt_date(s) -> str:
         return str(s) if s else "—"
 
 
-def determine_zone(entry_price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
-    """Определяет зону входа (1, 2, 3) на основе точек A и B."""
-    if entry_price is None or a is None or b is None or a == b:
+def determine_zone(price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
+    """Определяет зону (1, 2, 3) для заданной цены на основе точек A и B."""
+    if price is None or a is None or b is None or a == b:
         return None, None
     
     step = (b - a) / 3
@@ -150,11 +145,11 @@ def determine_zone(entry_price: float | None, a: float | None, b: float | None) 
     
     boundaries = (z1_low, z1_high, z2_low, z2_high, z3_low, z3_high)
     
-    if z1_low <= entry_price <= z1_high:
+    if z1_low <= price <= z1_high:
         return 1, boundaries
-    elif z2_low <= entry_price <= z2_high:
+    elif z2_low <= price <= z2_high:
         return 2, boundaries
-    elif z3_low <= entry_price <= z3_high:
+    elif z3_low <= price <= z3_high:
         return 3, boundaries
     return None, boundaries
 
@@ -165,7 +160,7 @@ def determine_zone(entry_price: float | None, a: float | None, b: float | None) 
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/3.0"})
+    s.headers.update({"User-Agent": "moex-futures-calc/4.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -310,7 +305,7 @@ def _to_instrument(row: pd.Series) -> Instrument:
 
 
 # ─────────────────────────────────────────────────────────────
-# СТРАНИЦА И CSS (СТРОГИЙ СТИЛЬ, МОБИЛЬНАЯ ОПТИМИЗАЦИЯ)
+# СТРАНИЦА И CSS
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Калькулятор фьючерсов MOEX",
@@ -368,6 +363,19 @@ st.markdown(
     .zone-1 { background: #e6f4ea; border: 1px solid #34a853; color: #137333; }
     .zone-2 { background: #fef7e0; border: 1px solid #f9ab00; color: #b06000; }
     .zone-3 { background: #fce8e6; border: 1px solid #ea4335; color: #c5221f; }
+    
+    .sidebar-ref {
+        background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px;
+        padding: 6px 8px; margin-top: 4px; margin-bottom: 8px;
+    }
+    .sidebar-ref-item {
+        font-size: 0.75rem; color: #495057; padding: 2px 0;
+        border-bottom: 1px dashed #dee2e6;
+    }
+    .sidebar-ref-item:last-child { border-bottom: none; }
+    .sidebar-ref-dir { font-weight: 700; }
+    .dir-long { color: #137333; }
+    .dir-short { color: #c5221f; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -379,7 +387,6 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────
 sheet_deposit, sheet_ticker_map = load_sheet_data()
 
-# Инициализация депозита из таблицы при первом запуске
 if "deposit_input" not in st.session_state:
     st.session_state.deposit_input = sheet_deposit
 
@@ -414,7 +421,7 @@ with st.sidebar:
     st.divider()
     
     st.header("Зоны риска A-B")
-    st.markdown("Диапазон делится на 3 зоны. Зона 1 (у A) — идеальна, зона 2 — повышенный риск, зона 3 (у B) — запрещена.")
+    st.markdown("Введите значения вручную, опираясь на справку ниже.")
     
     point_a = st.number_input(
         "Точка A", value=None, step=1.0, format="%.2f", placeholder="Цена точки A", key="point_a_input"
@@ -423,7 +430,25 @@ with st.sidebar:
         "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
     )
     
-    st.caption("LONG: A снизу, B сверху. SHORT: A сверху, B снизу.")
+    # СПРАВОЧНЫЙ БЛОК ИЗ GOOGLE SHEETS
+    st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
+    
+    # Тикер нужен для отображения справки, берем из session_state или дефолтный
+    current_ticker = st.session_state.get("ticker_select", "")
+    setups = sheet_ticker_map.get(current_ticker, [])
+    
+    if setups:
+        ref_html = "<div class='sidebar-ref'>"
+        for s in setups:
+            dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
+            dir_text = s.get("dir") or "N/A"
+            a_text = fmt_n(s["a"]) if s["a"] is not None else "—"
+            b_text = fmt_n(s["b"]) if s["b"] is not None else "—"
+            ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
+        ref_html += "</div>"
+        st.markdown(ref_html, unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='sidebar-ref'><div class='sidebar-ref-item'>Данных для этого тикера нет</div></div>", unsafe_allow_html=True)
     
     st.divider()
     if st.button("Обновить котировки", use_container_width=True):
@@ -457,9 +482,9 @@ futures = futures.sort_values("SECID").reset_index(drop=True)
 instruments: dict[str, Instrument] = {row["SECID"]: _to_instrument(row) for _, row in futures.iterrows()}
 
 
-# Выбор тикера с отображением TW-тикера
 def format_ticker(t: str) -> str:
-    tw = sheet_ticker_map.get(t, {}).get("tw", "")
+    setups = sheet_ticker_map.get(t, [])
+    tw = setups[0]["tw"] if setups and setups[0]["tw"] else ""
     return f"{t} ({tw})" if tw else t
 
 ticker = st.selectbox(
@@ -469,29 +494,13 @@ ticker = st.selectbox(
     key="ticker_select"
 )
 
-# Логика автозаполнения при смене тикера
+# Логика сброса полей при смене тикера
 if "last_ticker" not in st.session_state:
     st.session_state.last_ticker = ticker
 elif st.session_state.last_ticker != ticker:
-    # Сброс полей сделки
     for key in TRADE_STATE_KEYS:
         if key in st.session_state:
             del st.session_state[key]
-    
-    # Автозаполнение из Google Sheets, если данные есть
-    sheet_data = sheet_ticker_map.get(ticker, {})
-    if sheet_data.get("a") is not None:
-        st.session_state.point_a_input = sheet_data["a"]
-    if sheet_data.get("b") is not None:
-        st.session_state.point_b_input = sheet_data["b"]
-    
-    # Автоопределение направления
-    if sheet_data.get("a") is not None and sheet_data.get("b") is not None:
-        if sheet_data["a"] > sheet_data["b"]:
-            st.session_state.direction_radio = "SHORT"
-        elif sheet_data["a"] < sheet_data["b"]:
-            st.session_state.direction_radio = "LONG"
-            
     st.session_state.last_ticker = ticker
 
 inst = instruments[ticker]
@@ -506,7 +515,15 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.caption(f"1 пункт = {fmt_n(inst.point_value, 2)} руб. | Экспирация: {fmt_date(inst.expiry)}")
+
+# ИНДИКАТОР ТЕКУЩЕЙ ЗОНЫ ЦЕНЫ
+current_zone, _ = determine_zone(inst.price, point_a, point_b)
+if current_zone is not None:
+    zone_class = f"zone-{current_zone}"
+    zone_text = {1: "Зона 1 (Идеальная)", 2: "Зона 2 (Повышенный риск)", 3: "Зона 3 (Запрещена)"}
+    st.markdown(f'<div class="zone-indicator {zone_class}">Текущая цена в {zone_text[current_zone]}</div>', unsafe_allow_html=True)
+else:
+    st.caption(f"1 пункт = {fmt_n(inst.point_value, 2)} руб. | Экспирация: {fmt_date(inst.expiry)}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -571,24 +588,24 @@ have_prices = avg_entry is not None and sl is not None and tp is not None
 have_qty = effective_qty > 0
 warnings = []
 
-# Проверка зон риска A-B
-zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
+# Проверка зон риска A-B для точки ВХОДА
+entry_zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
 zone_blocked = False
 zone_reduction = 1.0
 zone_message = None
 
-if zone is not None and point_a is not None and point_b is not None:
-    if direction == "LONG" and zone == 3:
+if entry_zone is not None and point_a is not None and point_b is not None:
+    if direction == "LONG" and entry_zone == 3:
         zone_blocked = True
         zone_message = "ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для LONG. Высокий риск."
-    elif direction == "SHORT" and zone == 1:
+    elif direction == "SHORT" and entry_zone == 1:
         zone_blocked = True
         zone_message = "ЗАПРЕЩЕНО: вход в зоне 1 (у точки A) для SHORT. Высокий риск."
-    elif zone == 2:
+    elif entry_zone == 2:
         zone_reduction = 0.5
         zone_message = "Повышенный риск: зона 2. Рекомендуется сократить объём на 50%."
     else:
-        zone_message = f"Зона {zone}: оптимальная для {direction}."
+        zone_message = f"Зона {entry_zone}: оптимальная для {direction}."
 
 if have_prices:
     if direction == "LONG":
@@ -601,8 +618,8 @@ if have_prices:
 for w in warnings:
     st.warning(w)
 
-if zone is not None and zone_message:
-    zone_class = f"zone-{zone}"
+if entry_zone is not None and zone_message:
+    zone_class = f"zone-{entry_zone}"
     st.markdown(f'<div class="zone-indicator {zone_class}">{zone_message}</div>', unsafe_allow_html=True)
 
 st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
@@ -633,7 +650,6 @@ else:
     qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
     qty_rec = min(qty_by_risk, qty_by_margin)
     
-    # Применяем снижение объёма для зоны 2
     qty_rec = int(qty_rec * zone_reduction)
 
     rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
@@ -667,46 +683,4 @@ else:
             elif effective_qty <= safe_qty:
                 st.info(f"RR ниже плана, но объём {effective_qty} <= безопасного {safe_qty}")
             else:
-                new_risk = risk_per_ct * safe_qty
-                st.warning(f"Сократите до {safe_qty} конт. (риск снизится до {fmt_n(new_risk, 0)} руб.)")
-    else:
-        st.success(f"Сделка корректна: {effective_qty} конт. <= {qty_rec}, RR = {fmt_n(rr, 2)}")
-
-    with st.expander("Детали расчёта", expanded=False):
-        actual_risk_pct = (total_risk / deposit * 100) if deposit else 0
-        risk_exceeded = actual_risk_pct > risk_pct
-        risk_color = "#ea4335" if risk_exceeded else "#0e1117"
-        risk_style = f"color: {risk_color}; font-weight: 700;" if risk_exceeded else ""
-        
-        zone_info = ""
-        if zone is not None and zone_boundaries is not None:
-            z1_low, z1_high, z2_low, z2_high, z3_low, z3_high = zone_boundaries
-            zone_info = f"""
-**Зоны риска A-B:**
-- Зона 1 (идеальная): {fmt_n(z1_low, inst.decimals)} — {fmt_n(z1_high, inst.decimals)}
-- Зона 2 (повышенный риск): {fmt_n(z2_low, inst.decimals)} — {fmt_n(z2_high, inst.decimals)}
-- Зона 3 (запрещена): {fmt_n(z3_low, inst.decimals)} — {fmt_n(z3_high, inst.decimals)}
-- Точка входа в зоне: **{zone}**
-"""
-        
-        st.markdown(
-            f"""
-**Вход:** {fmt_n(avg_entry, inst.decimals)} | **Контрактов:** {fmt_n(effective_qty, 0)}
-
-**SL:** {fmt_n(sl_dist, inst.decimals)} пт = {fmt_n(sl_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(risk_per_ct, 2)} руб. / конт.**
-**TP:** {fmt_n(tp_dist, inst.decimals)} пт = {fmt_n(tp_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(profit_per_ct, 2)} руб. / конт.**
-
-**Бюджет риска:** {fmt_n(deposit, 0)} руб. x {fmt_n(risk_pct, 1)}% = **{fmt_n(risk_budget, 0)} руб.**
-**Qty по риску:** {fmt_n(qty_by_risk, 0)} конт. | **Qty по ГО:** {fmt_n(qty_by_margin, 0)} конт.
-{f'**Корректировка зоны:** x{zone_reduction} (зона 2)' if zone_reduction < 1.0 else ''}
-
-**Итог на {fmt_n(effective_qty, 0)} конт.:**
-- Прибыль при TP: **+{fmt_n(total_reward, 2)} руб.**
-- Убыток при SL: **-{fmt_n(total_risk, 2)} руб.**
-- Фактический риск: <span style="{risk_style}">**{fmt_n(actual_risk_pct, 2)}%** от депозита</span>{' (ПРЕВЫШАЕТ УСТАНОВЛЕННЫЙ РИСК)' if risk_exceeded else ''}
-
-{zone_info}
-*Источник данных ГО: таблица клиринга MOEX ISS (параметр {margin_type})*
-""",
-            unsafe_allow_html=True,
-        )
+                new_risk = risk_per_ct * safe
