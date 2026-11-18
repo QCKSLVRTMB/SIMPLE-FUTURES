@@ -683,4 +683,46 @@ else:
             elif effective_qty <= safe_qty:
                 st.info(f"RR ниже плана, но объём {effective_qty} <= безопасного {safe_qty}")
             else:
-                new_risk = risk_per_ct * safe
+                new_risk = risk_per_ct * safe_qty
+                st.warning(f"Сократите до {safe_qty} конт. (риск снизится до {fmt_n(new_risk, 0)} руб.)")
+    else:
+        st.success(f"Сделка корректна: {effective_qty} конт. <= {qty_rec}, RR = {fmt_n(rr, 2)}")
+
+    with st.expander("Детали расчёта", expanded=False):
+        actual_risk_pct = (total_risk / deposit * 100) if deposit else 0
+        risk_exceeded = actual_risk_pct > risk_pct
+        risk_color = "#ea4335" if risk_exceeded else "#0e1117"
+        risk_style = f"color: {risk_color}; font-weight: 700;" if risk_exceeded else ""
+        
+        zone_info = ""
+        if entry_zone is not None and zone_boundaries is not None:
+            z1_low, z1_high, z2_low, z2_high, z3_low, z3_high = zone_boundaries
+            zone_info = f"""
+**Зоны риска A-B:**
+- Зона 1 (идеальная): {fmt_n(z1_low, inst.decimals)} — {fmt_n(z1_high, inst.decimals)}
+- Зона 2 (повышенный риск): {fmt_n(z2_low, inst.decimals)} — {fmt_n(z2_high, inst.decimals)}
+- Зона 3 (запрещена): {fmt_n(z3_low, inst.decimals)} — {fmt_n(z3_high, inst.decimals)}
+- Точка входа в зоне: **{entry_zone}**
+"""
+        
+        st.markdown(
+            f"""
+**Вход:** {fmt_n(avg_entry, inst.decimals)} | **Контрактов:** {fmt_n(effective_qty, 0)}
+
+**SL:** {fmt_n(sl_dist, inst.decimals)} пт = {fmt_n(sl_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(risk_per_ct, 2)} руб. / конт.**
+**TP:** {fmt_n(tp_dist, inst.decimals)} пт = {fmt_n(tp_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(profit_per_ct, 2)} руб. / конт.**
+
+**Бюджет риска:** {fmt_n(deposit, 0)} руб. x {fmt_n(risk_pct, 1)}% = **{fmt_n(risk_budget, 0)} руб.**
+**Qty по риску:** {fmt_n(qty_by_risk, 0)} конт. | **Qty по ГО:** {fmt_n(qty_by_margin, 0)} конт.
+{f'**Корректировка зоны:** x{zone_reduction} (зона 2)' if zone_reduction < 1.0 else ''}
+
+**Итог на {fmt_n(effective_qty, 0)} конт.:**
+- Прибыль при TP: **+{fmt_n(total_reward, 2)} руб.**
+- Убыток при SL: **-{fmt_n(total_risk, 2)} руб.**
+- Фактический риск: <span style="{risk_style}">**{fmt_n(actual_risk_pct, 2)}%** от депозита</span>{' (ПРЕВЫШАЕТ УСТАНОВЛЕННЫЙ РИСК)' if risk_exceeded else ''}
+
+{zone_info}
+*Источник данных ГО: таблица клиринга MOEX ISS (параметр {margin_type})*
+""",
+            unsafe_allow_html=True,
+        )
