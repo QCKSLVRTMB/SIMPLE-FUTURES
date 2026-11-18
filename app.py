@@ -1,5 +1,5 @@
 """
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Multi-Setup Reference).
+Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Deposit Parsing).
 Автоматически подгружает справочные данные из Google Sheets.
 Зависимости: streamlit, pandas, requests.
 """
@@ -48,28 +48,54 @@ TRADE_STATE_KEYS = [
 
 
 # ─────────────────────────────────────────────────────────────
+# ПАРСИНГ ЧИСЕЛ
+# ─────────────────────────────────────────────────────────────
+def parse_number(val) -> float | None:
+    """Универсальный парсинг чисел из ячеек таблицы (учитывает пробелы, запятые, валюту)."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return None
+    # Убираем валютные символы, пробелы, меняем запятую на точку
+    s = s.replace("р.", "").replace("руб.", "").replace("₽", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
 # ЗАГРУЗКА ДАННЫХ ИЗ GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_sheet_data() -> tuple[float, dict]:
-    """Загружает депозит и список всех сетапов (A, B) для тикеров."""
+    """Загружает депозит из B1 и список всех сетапов (A, B) для тикеров."""
     default_deposit = 100000.0
-    ticker_map = {} # ticker -> list of setups
+    ticker_map = {}
     
     try:
         df = pd.read_csv(SHEET_URL, header=None)
         
-        # 1. Поиск депозита
-        deposit_rows = df[df[0].astype(str).str.contains("Депозит", na=False, case=False)]
-        if not deposit_rows.empty:
-            val_str = str(deposit_rows.iloc[0, 1])
-            val_str = val_str.replace("р.", "").replace(" ", "").replace(",", ".").strip()
-            try:
-                default_deposit = float(val_str)
-            except ValueError:
-                pass
-
-        # 2. Поиск таблицы тикеров
+        # 1. ДЕПОЗИТ: сначала пробуем напрямую из B1 (строка 0, столбец 1)
+        if len(df) > 0 and len(df.columns) > 1:
+            val = parse_number(df.iloc[0, 1])
+            if val is not None and val > 0:
+                default_deposit = val
+        
+        # 2. Fallback: ищем слово "Депозит" в любом столбце и берем значение справа
+        if default_deposit == 100000.0:
+            for col_idx in range(min(4, len(df.columns))):
+                deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
+                if not deposit_rows.empty:
+                    row_idx = deposit_rows.index[0]
+                    if col_idx + 1 < len(df.columns):
+                        val = parse_number(df.iloc[row_idx, col_idx + 1])
+                        if val is not None and val > 0:
+                            default_deposit = val
+                            break
+        
+        # 3. Поиск таблицы тикеров
         header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
         if not header_idx.empty:
             idx = header_idx[0]
@@ -80,16 +106,9 @@ def load_sheet_data() -> tuple[float, dict]:
                 t = str(row["Тикер"]).strip()
                 if t and t.lower() != "nan":
                     tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
-                    
-                    pt_a, pt_b = None, None
-                    if pd.notna(row["A"]) and str(row["A"]).strip():
-                        try: pt_a = float(str(row["A"]).replace(",", ".").strip())
-                        except ValueError: pass
-                    if pd.notna(row["B"]) and str(row["B"]).strip():
-                        try: pt_b = float(str(row["B"]).replace(",", ".").strip())
-                        except ValueError: pass
+                    pt_a = parse_number(row["A"])
+                    pt_b = parse_number(row["B"])
 
-                    # Определяем направление на основе A и B
                     direction = None
                     if pt_a is not None and pt_b is not None:
                         direction = "LONG" if pt_a < pt_b else "SHORT"
@@ -133,7 +152,6 @@ def fmt_date(s) -> str:
 
 
 def determine_zone(price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
-    """Определяет зону (1, 2, 3) для заданной цены на основе точек A и B."""
     if price is None or a is None or b is None or a == b:
         return None, None
     
@@ -160,7 +178,7 @@ def determine_zone(price: float | None, a: float | None, b: float | None) -> tup
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/4.0"})
+    s.headers.update({"User-Agent": "moex-futures-calc/5.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -387,8 +405,10 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────
 sheet_deposit, sheet_ticker_map = load_sheet_data()
 
-if "deposit_input" not in st.session_state:
+# Инициализация депозита из таблицы при первом запуске сессии
+if "deposit_initialized" not in st.session_state:
     st.session_state.deposit_input = sheet_deposit
+    st.session_state.deposit_initialized = True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -399,9 +419,16 @@ with st.sidebar:
     st.markdown("Основные параметры для расчёта объёма позиции.")
     
     deposit = st.number_input(
-        "Депозит, руб.", min_value=0.0, value=float(st.session_state.deposit_input), 
+        "Депозит, руб.", min_value=0.0, 
         step=1000.0, format="%.0f", key="deposit_input"
     )
+    
+    # СПРАВКА ПО ДЕПОЗИТУ ИЗ ТАБЛИЦЫ
+    st.markdown(
+        f"<div class='sidebar-ref'><div class='sidebar-ref-item'>Из таблицы (B1): <b>{fmt_n(sheet_deposit, 0)} руб.</b></div></div>",
+        unsafe_allow_html=True
+    )
+    
     risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
     
     st.divider()
@@ -433,7 +460,6 @@ with st.sidebar:
     # СПРАВОЧНЫЙ БЛОК ИЗ GOOGLE SHEETS
     st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
     
-    # Тикер нужен для отображения справки, берем из session_state или дефолтный
     current_ticker = st.session_state.get("ticker_select", "")
     setups = sheet_ticker_map.get(current_ticker, [])
     
@@ -588,7 +614,6 @@ have_prices = avg_entry is not None and sl is not None and tp is not None
 have_qty = effective_qty > 0
 warnings = []
 
-# Проверка зон риска A-B для точки ВХОДА
 entry_zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
 zone_blocked = False
 zone_reduction = 1.0
