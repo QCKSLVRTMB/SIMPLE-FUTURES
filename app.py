@@ -1,748 +1,576 @@
-"""
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Execution Order).
-Автоматически подгружает справочные данные из Google Sheets.
-Зависимости: streamlit, pandas, requests.
-"""
-from __future__ import annotations
+//@version=6
+indicator("QCKSLVR TRADING", shorttitle="QCKSLVR", format=format.volume, overlay=false, max_labels_count=500)
 
-import math
-from dataclasses import dataclass
-from datetime import datetime
-from io import StringIO
+// ─────────────────────────────────────────────────────────────────────
+// НАСТРОЙКИ
+// ─────────────────────────────────────────────────────────────────────
 
-import pandas as pd
-import requests
-import streamlit as st
-from requests.adapters import HTTPAdapter, Retry
+showSignals = input.bool(true, "Показать все сигналы на графике", group="Отображение сигналов")
+showPP      = input.bool(true, "Показать сигналы ПП", group="Отображение сигналов")
 
-# ─────────────────────────────────────────────────────────────
-# КОНСТАНТЫ
-# ─────────────────────────────────────────────────────────────
-ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0/export?format=csv"
+showMA         = input.bool(false, "Показать MA объема", group="Гистограмма объема")
+lengthVolumeMA = input.int(20, "Период MA объема", minval=1, group="Гистограмма объема")
 
-MARGIN_LEVELS = ["НАЧ. ГО", "КНУР", "КСУР", "КПУР", "КОУР"]
-MARGIN_HINTS = {
-    "НАЧ. ГО": "НАЧ. ГО — базовое гарантийное обеспечение",
-    "КНУР":    "КНУР — начальный уровень риска (LRC)",
-    "КСУР":    "КСУР — стандартный уровень риска (MRC)",
-    "КПУР":    "КПУР — повышенный уровень риска (HRC)",
-    "КОУР":    "КОУР — особый уровень риска (ERC)",
-}
+isMoex          = input.bool(true, "Режим MOEX (5 торговых дней)", group="Поиск аномалий")
+periodMultiplier = input.float(1.0, "Множитель периода (1 = стандарт)", step=0.1, group="Поиск аномалий")
 
-IMS_MARGIN_MAP = {
-    "НАЧ. ГО": ("IM_BUY",      "IM_SELL"),
-    "КНУР":    ("IM_BUY_LRC",  "IM_SELL_LRC"),
-    "КСУР":    ("IM_BUY_MRC",  "IM_SELL_MRC"),
-    "КПУР":    ("IM_BUY_HRC",  "IM_SELL_HRC"),
-    "КОУР":    ("IM_BUY_ERC",  "IM_SELL_ERC"),
-}
+anomaly_W    = input.float(100.0, "W: Аномалия (%)", step=10.0, group="Поиск аномалий")
+anomaly_D    = input.float(80.0, "D: Аномалия (%)", step=10.0, group="Поиск аномалий")
+anomaly_H    = input.float(80.0, "H: Аномалия (%)", step=10.0, group="Поиск аномалий")
+anomaly_10m  = input.float(100.0, "10m: Аномалия (%)", step=10.0, group="Поиск аномалий")
+anomaly_1m   = input.float(120.0, "1m: Аномалия (%)", step=10.0, group="Поиск аномалий")
 
-TRADE_STATE_KEYS = [
-    "sl_input", "tp_input",
-    "entry_p_0", "entry_q_0",
-    "entry_p_1", "entry_q_1",
-    "entry_p_2", "entry_q_2",
-    "point_a_input", "point_b_input",
-]
+moscowTimezone = input.string("Europe/Moscow", "Часовой пояс торговой сессии", group="Торговая сессия")
+sessionStartHour = input.int(7, "Начало сессии, час", minval=0, maxval=23, group="Торговая сессия")
+sessionStartMinute = input.int(0, "Начало сессии, минута", minval=0, maxval=59, group="Торговая сессия")
+sessionEndHour = input.int(23, "Окончание сессии, час", minval=0, maxval=23, group="Торговая сессия")
+sessionEndMinute = input.int(50, "Окончание сессии, минута", minval=0, maxval=59, group="Торговая сессия")
 
+showSOS_SOW_W   = input.bool(true, "SOS/SOW на Недельном (W)", group="Видимость: SOS/SOW")
+showSOS_SOW_D   = input.bool(true, "SOS/SOW на Дневном (D)", group="Видимость: SOS/SOW")
+showSOS_SOW_H   = input.bool(true, "SOS/SOW на Часовом (H)", group="Видимость: SOS/SOW")
 
-# ─────────────────────────────────────────────────────────────
-# ПАРСИНГ И ФОРМАТИРОВАНИЕ
-# ─────────────────────────────────────────────────────────────
-def parse_number(val) -> float | None:
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return None
-    s = str(val).strip()
-    if not s or s.lower() == "nan":
-        return None
-    s = s.replace("р.", "").replace("руб.", "").replace("₽", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
-    try:
-        return float(s)
-    except ValueError:
-        return None
+showSA_SOT_W    = input.bool(true, "SA/SOT на Недельном (W)", group="Видимость: SA/SOT")
+showSA_SOT_D    = input.bool(true, "SA/SOT на Дневном (D)", group="Видимость: SA/SOT")
+showSA_SOT_H    = input.bool(true, "SA/SOT на Часовом (H)", group="Видимость: SA/SOT")
+showSA_SOT_10m  = input.bool(true, "SA/SOT на 10м", group="Видимость: SA/SOT")
+showSA_SOT_1m   = input.bool(true, "SA/SOT на 1м", group="Видимость: SA/SOT")
 
+showND_NS_W     = input.bool(true, "ND/NS на Недельном (W)", group="Видимость: ND/NS")
+showND_NS_D     = input.bool(true, "ND/NS на Дневном (D)", group="Видимость: ND/NS")
+showND_NS_H     = input.bool(true, "ND/NS на Часовом (H)", group="Видимость: ND/NS")
+showND_NS_10m   = input.bool(true, "ND/NS на 10м", group="Видимость: ND/NS")
+showND_NS_1m    = input.bool(true, "ND/NS на 1м", group="Видимость: ND/NS")
 
-def fmt_n(v, decimals: int = 0) -> str:
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return "—"
-    d = max(0, min(int(decimals), 6))
-    s = f"{v:.{d}f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s.replace(".", ",")
+showPP_W     = input.bool(false, "ПП на Недельном (W)", group="Видимость: ПП")
+showPP_D     = input.bool(true,  "ПП на Дневном (D)", group="Видимость: ПП")
+showPP_H     = input.bool(true,  "ПП на Часовом (H)", group="Видимость: ПП")
 
+sosSowMinBars = input.int(3, "SOS/SOW: Кол-во баров в импульсе", minval=2, group="Структура SOS/SOW")
+sosSowOnlyStrongVolume = input.bool(false, "SOS/SOW: Только чёрный или аномальный объём", group="Структура SOS/SOW")
 
-def fmt_date(s) -> str:
-    try:
-        s = str(s).strip()
-        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
-    except Exception:
-        return str(s) if s else "—"
+// Параметры VSA (NR -> NS/ND)
+grpCorr = "Коррекция (NR)"
+minCorrBars     = input.int(2,  "Мин. кол-во баров в откате",  minval = 2, group = grpCorr, tooltip="Минимальное количество баров в откате, после которого мы начинаем искать сигнал.")
+maxCorrBarVol   = input.float(0.30, "Макс. объём одного бара коррекции / Effort Vol", minval = 0.05, group = grpCorr)
+maxCloseRange   = input.float(0.50, "Макс. разброс закрытий коррекции × ATR", minval = 0.1, group = grpCorr)
+maxStepClosePct = input.float(25.0, "Макс. шаг закрытий отката (% от диапазона усилия)", minval = 0.0, step = 1.0, group = grpCorr)
 
+grpSignal = "Сигнальный бар NS / ND"
+dojiBodyRatio   = input.float(0.25, "Дожи: тело ≤ диапазона ×", group = grpSignal)
+closeThirdPct   = input.float(0.33, "Граница трети (0.33 = 1/3)", group = grpSignal)
 
-def determine_zone(price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
-    if price is None or a is None or b is None or a == b:
-        return None, None
+saSotDevPct     = input.float(20.0, "SA/SOT: Отклонение (в % от диапазона/объема)", minval=0.0, maxval=100.0, step=1.0, group="Параметры SA/SOT")
+saSotTailRatio  = input.float(1.2, "SA/SOT: Доминирование хвоста", step=0.1, group="Параметры SA/SOT")
+saSotAllowRegularVol = input.bool(true, "SA/SOT: Допускать обычные (серые) объёмы", group="Параметры SA/SOT", tooltip="Вкл: анализируются любые объёмы, включая серые (как в исходных правилах). Выкл: только чёрный или аномальный объём сигнального бара.")
+
+vRequireAnomaly = input.bool(true, "V: Только аномальный объем", group="Параметры Перебивка V")
+vMaxBars        = input.int(3, "V: Макс. баров для перебивки", minval=1, maxval=10, group="Параметры Перебивка V")
+
+ppVolSpurt      = input.float(25.0, "ПП: Превышение объема (%)", step=5.0, group="Параметры ПП")
+ppOnlyAnomaly   = input.bool(false, "ПП: Только аномальный объем", group="Параметры ПП")
+
+showDiag = input.bool(false, "Показать таблицу диагностики", group="Диагностика")
+
+// ─────────────────────────────────────────────────────────────────────
+// ТАЙМФРЕЙМ И ВИДИМОСТЬ
+// ─────────────────────────────────────────────────────────────────────
+string tf = timeframe.period
+
+bool isWeekly = tf == "W" or tf == "1W"
+bool isDaily  = tf == "D" or tf == "1D"
+bool isHourly = tf == "60" or tf == "1H"
+bool is10m    = tf == "10"
+bool is1m     = tf == "1"
+
+bool isIntraday = timeframe.isintraday
+
+int barHourMoscow = hour(time, moscowTimezone)
+int barMinuteMoscow = minute(time, moscowTimezone)
+int barWeekdayMoscow = dayofweek(time, moscowTimezone)
+
+bool isWeekdayMoscow = barWeekdayMoscow >= dayofweek.monday and barWeekdayMoscow <= dayofweek.friday
+bool isWeekendMoscow = barWeekdayMoscow == dayofweek.saturday or barWeekdayMoscow == dayofweek.sunday
+bool signalsAllowedByDay = not isWeekendMoscow
+
+int barMinutesMoscow = barHourMoscow * 60 + barMinuteMoscow
+int sessionStartMinutes = sessionStartHour * 60 + sessionStartMinute
+int sessionEndMinutes = sessionEndHour * 60 + sessionEndMinute
+
+bool isMoscowSessionBar = isIntraday and isWeekdayMoscow and barMinutesMoscow >= sessionStartMinutes and barMinutesMoscow < sessionEndMinutes
+
+bool sosSowAllowed = (isWeekly or isDaily or isHourly) and signalsAllowedByDay
+
+bool showSOS_SOW_tf = (isWeekly and showSOS_SOW_W) or (isDaily and showSOS_SOW_D) or (isHourly and showSOS_SOW_H)
+bool showSA_SOT_tf  = (isWeekly and showSA_SOT_W) or (isDaily and showSA_SOT_D) or (isHourly and showSA_SOT_H) or (is10m and showSA_SOT_10m) or (is1m and showSA_SOT_1m)
+bool showND_NS_tf   = (isWeekly and showND_NS_W) or (isDaily and showND_NS_D) or (isHourly and showND_NS_H) or (is10m and showND_NS_10m) or (is1m and showND_NS_1m)
+bool showPP_tf      = (isWeekly and showPP_W) or (isDaily and showPP_D) or (isHourly and showPP_H)
+
+color tfColor = color.gray
+if isWeekly
+    tfColor := color.purple
+else if isDaily
+    tfColor := color.blue
+else if isHourly
+    tfColor := color.green
+else if is10m or is1m
+    tfColor := color.red
+
+// ─────────────────────────────────────────────────────────────────────
+// БАЗОВЫЕ РАСЧЕТЫ И ГИСТОГРАММА ОБЪЕМА
+// ─────────────────────────────────────────────────────────────────────
+bool isLargeSimple = barstate.isconfirmed and volume > volume[1] and volume > volume[2]
+
+var float volumeMA = na
+volumeMA := na(volumeMA) ? volume : volumeMA + (volume - volumeMA) / lengthVolumeMA
+
+float volAvg = na
+int activeLookback = 52
+float activeAnomalyPct = anomaly_D
+
+if isWeekly
+    activeLookback := math.round(52 * periodMultiplier)
+    activeAnomalyPct := anomaly_W
+else if isDaily
+    activeLookback := math.round((isMoex ? 22 : 30) * periodMultiplier)
+    activeAnomalyPct := anomaly_D
+else if isHourly
+    activeLookback := math.round((isMoex ? 85 : 168) * periodMultiplier)
+    activeAnomalyPct := anomaly_H
+else if is10m
+    activeLookback := math.round((isMoex ? 505 : 1008) * periodMultiplier)
+    activeAnomalyPct := anomaly_10m
+else if is1m
+    activeLookback := math.round((isMoex ? 5050 : 10080) * periodMultiplier)
+    activeAnomalyPct := anomaly_1m
+
+if not isMoex
+    volAvg := ta.sma(volume, activeLookback)
+else
+    float sumVol = 0.0
+    int count = 0
+    int i = 0
+    while count < activeLookback and i <= bar_index
+        int day = dayofweek(time[i])
+        if day != dayofweek.saturday and day != dayofweek.sunday
+            sumVol += volume[i]
+            count += 1
+        i += 1
+    if count > 0
+        volAvg := sumVol / count
+
+bool isAnomaly = not na(volAvg) and volume > volAvg * (1 + activeAnomalyPct / 100)
+
+// VSA базовые расчеты
+float atr = ta.atr(14)
+float barRange = high - low
+float bodySize = math.abs(close - open)
+bool isDoji = barRange > 0 and bodySize <= barRange * dojiBodyRatio
+float closePos = barRange > 0 ? (close - low) / barRange : 0.5
+
+color histColor = isAnomaly ? tfColor : (isLargeSimple ? color.black : color.gray)
+plot(volume, color=histColor, style=plot.style_columns, title="Объем")
+plot(showMA ? volumeMA : na, style=plot.style_line, color=color.green, title="MA объема")
+
+// ─────────────────────────────────────────────────────────────────────
+// ЛОГИКА СИГНАЛОВ
+// ─────────────────────────────────────────────────────────────────────
+bool sigBuyBar  = close[0] > close[1]
+bool sigSellBar = close[0] < close[1]
+bool prevBuy    = close[1] > close[2]
+bool prevSell   = close[1] < close[2]
+
+// --- SOS / SOW ---
+bool consecBuyUp    = true
+bool consecSellDown = true
+
+for i = 0 to sosSowMinBars - 1
+    consecBuyUp    := consecBuyUp and close[i] > close[i+1]
+    consecSellDown := consecSellDown and close[i] < close[i+1]
+
+bool volumeGrowsInMove = not na(volume[sosSowMinBars - 1]) and volume[0] > volume[sosSowMinBars - 1]
+
+bool strongVolumeInMove = true
+for i = 0 to sosSowMinBars - 1
+    strongVolumeInMove := strongVolumeInMove and (isLargeSimple[i] or isAnomaly[i])
+
+bool strongVolumeOk = sosSowOnlyStrongVolume ? strongVolumeInMove : true
+
+bool condSOS = signalsAllowedByDay and consecBuyUp and volumeGrowsInMove and strongVolumeOk
+bool condSOW = signalsAllowedByDay and consecSellDown and volumeGrowsInMove and strongVolumeOk
+
+bool SOS = showSignals and signalsAllowedByDay and showSOS_SOW_tf and condSOS and barstate.isconfirmed
+bool SOW = showSignals and signalsAllowedByDay and showSOS_SOW_tf and condSOW and barstate.isconfirmed
+
+// --- SA / SOT ---
+float rangeHigh = math.max(high[0], high[1])
+float rangeLow = math.min(low[0], low[1])
+float priceRange = rangeHigh - rangeLow
+float onePercentOfPriceRange = priceRange > 0 ? priceRange / 100.0 : 0.0
+
+float actualCloseDiff = math.abs(close[0] - close[1])
+float closeDevInPctOfRange = onePercentOfPriceRange > 0 ? actualCloseDiff / onePercentOfPriceRange : 0.0
+bool saSotCloseOk = closeDevInPctOfRange <= saSotDevPct
+
+float volDevPct = volume[1] == 0 ? 100.0 : math.abs(volume[0] - volume[1]) / volume[1] * 100
+bool saSotVolOk = volDevPct <= saSotDevPct
+
+bool previousBarWasSelling = close[1] < open[1]
+bool previousBarWasBuying = close[1] > open[1]
+bool signalBarBought = close[0] > open[0]
+bool signalBarSold = close[0] < open[0]
+bool signalGapDown = open[0] < close[1]
+bool signalGapUp = open[0] > close[1]
+
+float saBuyTail = close[0] - low[0]
+float saSellTail = high[0] - close[0]
+bool saTailDominant = saBuyTail >= saSellTail * saSotTailRatio
+
+// Фильтр цвета объёма сигнального бара: чёрный (isLargeSimple) или аномальный (isAnomaly).
+// saSotAllowRegularVol = true разрешает также обычные (серые) объёмы (поведение исходных правил).
+bool saSotVolColorOk = saSotAllowRegularVol or isLargeSimple or isAnomaly
+
+bool rawSA = previousBarWasSelling and signalBarBought and signalGapDown and saSotVolOk and saSotCloseOk and saTailDominant and saSotVolColorOk
+
+float sotSellTail = high[0] - close[0]
+float sotBuyTail = close[0] - low[0]
+bool sotTailDominant = sotSellTail >= sotBuyTail * saSotTailRatio
+
+bool rawSOT = previousBarWasBuying and signalBarSold and signalGapUp and saSotVolOk and saSotCloseOk and sotTailDominant and saSotVolColorOk
+
+bool SA = showSignals and signalsAllowedByDay and showSA_SOT_tf and rawSA and barstate.isconfirmed
+bool SOT = showSignals and signalsAllowedByDay and showSA_SOT_tf and rawSOT and barstate.isconfirmed
+
+// --- NR → ND / NS (VSA) ---
+int barsSinceSOS = ta.barssince(condSOS)
+int barsSinceSOW = ta.barssince(condSOW)
+float highestHighEffort = ta.highest(high, sosSowMinBars)
+float lowestLowEffort = ta.lowest(low, sosSowMinBars)
+
+float ns_maxVol = na
+float ns_effortVol = na
+float ns_maxClose = na
+float ns_minClose = na
+float ns_maxStep = na
+float ns_maxStepAllowed = na
+bool ns_brokeLow = false
+bool ns_volWeak = false
+bool ns_tight = false
+bool ns_stepOk = false
+bool ns_signal = false
+bool ns_firstBarsOk = false
+
+if not na(barsSinceSOS) and barsSinceSOS >= minCorrBars
+    float effortHigh = highestHighEffort[barsSinceSOS]
+    float effortLow  = lowestLowEffort[barsSinceSOS]
+    ns_effortVol  := volume[barsSinceSOS]
+    float effortRange = effortHigh - effortLow
+
+    // Проверка первых двух баров отката (для NS они должны быть ПРОДАЖАМИ)
+    ns_firstBarsOk := true
+    if barsSinceSOS >= 2
+        if close[barsSinceSOS - 1] >= close[barsSinceSOS] or close[barsSinceSOS - 2] >= close[barsSinceSOS - 1]
+            ns_firstBarsOk := false
+
+    float maxVol = 0.0
+    float maxClose = -1.0
+    float minClose = 9999999.0
+    float maxStep = 0.0
+    bool brokeLow = false
+
+    for i = 1 to barsSinceSOS - 1
+        maxVol := math.max(maxVol, volume[i])
+        maxClose := math.max(maxClose, close[i])
+        minClose := math.min(minClose, close[i])
+        if math.abs(close[i] - close[i+1]) > maxStep
+            maxStep := math.abs(close[i] - close[i+1])
+        if low[i] < effortLow
+            brokeLow := true
+
+    if math.abs(close[0] - close[1]) > maxStep
+        maxStep := math.abs(close[0] - close[1])
+    maxClose := math.max(maxClose, close[0])
+    minClose := math.min(minClose, close[0])
+    if low[0] < effortLow
+        brokeLow := true
+
+    ns_maxVol := maxVol
+    ns_maxClose := maxClose
+    ns_minClose := minClose
+    ns_maxStep := maxStep
+    ns_maxStepAllowed := effortRange * maxStepClosePct / 100.0
+    ns_brokeLow := brokeLow
+
+    bool isVolumeWeak = maxVol < ns_effortVol * maxCorrBarVol
+    bool isTight = (maxClose - minClose) < atr * maxCloseRange
+    bool isStepOk = maxStep <= ns_maxStepAllowed
+
+    bool isLowestVolume = volume[0] < volume[1] and volume[0] < volume[2]
+    bool nsShapeOk = open[0] > close[0] or isDoji
+    bool nsCloseOk = isDoji or closePos <= closeThirdPct
+
+    ns_signal := isVolumeWeak and isTight and isLowestVolume and nsShapeOk and nsCloseOk and not brokeLow and isStepOk and ns_firstBarsOk
+    ns_volWeak := isVolumeWeak
+    ns_tight := isTight
+    ns_stepOk := isStepOk
+
+float nd_maxVol = na
+float nd_effortVol = na
+float nd_maxClose = na
+float nd_minClose = na
+float nd_maxStep = na
+float nd_maxStepAllowed = na
+bool nd_brokeHigh = false
+bool nd_volWeak = false
+bool nd_tight = false
+bool nd_stepOk = false
+bool nd_signal = false
+bool nd_firstBarsOk = false
+
+if not na(barsSinceSOW) and barsSinceSOW >= minCorrBars
+    float effortHigh = highestHighEffort[barsSinceSOW]
+    float effortLow  = lowestLowEffort[barsSinceSOW]
+    nd_effortVol  := volume[barsSinceSOW]
+    float effortRange = effortHigh - effortLow
+
+    // Проверка первых двух баров отката (для ND они должны быть ПОКУПКАМИ)
+    nd_firstBarsOk := true
+    if barsSinceSOW >= 2
+        if close[barsSinceSOW - 1] <= close[barsSinceSOW] or close[barsSinceSOW - 2] <= close[barsSinceSOW - 1]
+            nd_firstBarsOk := false
+
+    float maxVol = 0.0
+    float maxClose = -1.0
+    float minClose = 9999999.0
+    float maxStep = 0.0
+    bool brokeHigh = false
+
+    for i = 1 to barsSinceSOW - 1
+        maxVol := math.max(maxVol, volume[i])
+        maxClose := math.max(maxClose, close[i])
+        minClose := math.min(minClose, close[i])
+        if math.abs(close[i] - close[i+1]) > maxStep
+            maxStep := math.abs(close[i] - close[i+1])
+        if high[i] > effortHigh
+            brokeHigh := true
+
+    if math.abs(close[0] - close[1]) > maxStep
+        maxStep := math.abs(close[0] - close[1])
+    maxClose := math.max(maxClose, close[0])
+    minClose := math.min(minClose, close[0])
+    if high[0] > effortHigh
+        brokeHigh := true
+
+    nd_maxVol := maxVol
+    nd_maxClose := maxClose
+    nd_minClose := minClose
+    nd_maxStep := maxStep
+    nd_maxStepAllowed := effortRange * maxStepClosePct / 100.0
+    nd_brokeHigh := brokeHigh
+
+    bool isVolumeWeak = maxVol < nd_effortVol * maxCorrBarVol
+    bool isTight = (maxClose - minClose) < atr * maxCloseRange
+    bool isStepOk = maxStep <= nd_maxStepAllowed
+
+    bool isLowestVolume = volume[0] < volume[1] and volume[0] < volume[2]
+    bool ndShapeOk = close[0] > open[0] or isDoji
+    bool ndCloseOk = isDoji or closePos >= (1.0 - closeThirdPct)
+
+    nd_signal := isVolumeWeak and isTight and isLowestVolume and ndShapeOk and ndCloseOk and not brokeHigh and isStepOk and nd_firstBarsOk
+    nd_volWeak := isVolumeWeak
+    nd_tight := isTight
+    nd_stepOk := isStepOk
+
+bool ND = showSignals and signalsAllowedByDay and showND_NS_tf and nd_signal and barstate.isconfirmed
+bool NS = showSignals and signalsAllowedByDay and showND_NS_tf and ns_signal and barstate.isconfirmed
+
+// --- Перебивка V ---
+var float sessMaxVol = 0
+var int sessMaxVolIdx = -1
+var float sessMaxVolHigh = na
+var float sessMaxVolLow = na
+var bool sessMaxVolIsRed = false
+var bool sessMaxVolIsAnomaly = false
+
+bool isNewSession = ta.change(time("D")) != 0
+
+if signalsAllowedByDay and (isNewSession or volume > sessMaxVol)
+    sessMaxVol := volume
+    sessMaxVolIdx := bar_index
+    sessMaxVolHigh := high
+    sessMaxVolLow := low
+    sessMaxVolIsRed := (close < open)
+    sessMaxVolIsAnomaly := isAnomaly
+
+int maxOffset = bar_index - sessMaxVolIdx
+bool rawVBuy = false
+bool rawVSell = false
+bool vAnomalyOk = vRequireAnomaly ? sessMaxVolIsAnomaly : true
+
+if signalsAllowedByDay and isIntraday and vAnomalyOk and (maxOffset >= 1 and maxOffset <= vMaxBars)
+    if sessMaxVolIsRed
+        bool firstBreak = true
+        for i = 1 to maxOffset - 1
+            if close[i] > sessMaxVolHigh
+                firstBreak := false
+        if firstBreak and close[0] > sessMaxVolHigh
+            rawVBuy := true
+    else
+        bool firstBreak = true
+        for i = 1 to maxOffset - 1
+            if close[i] < sessMaxVolLow
+                firstBreak := false
+        if firstBreak and close[0] < sessMaxVolLow
+            rawVSell := true
+
+bool VBuy = showSignals and signalsAllowedByDay and rawVBuy and barstate.isconfirmed
+bool VSell = showSignals and signalsAllowedByDay and rawVSell and barstate.isconfirmed
+
+// --- ПП ---
+bool ppAnomalyOk = ppOnlyAnomaly ? isAnomaly[0] : true
+bool rawPPBuy = prevSell and sigBuyBar and (volume[0] >= volume[1] * (1 + ppVolSpurt / 100)) and ppAnomalyOk and close[0] > high[1]
+bool rawPPSell = prevBuy and sigSellBar and (volume[0] >= volume[1] * (1 + ppVolSpurt / 100)) and ppAnomalyOk and close[0] < low[1]
+
+bool PPBuy  = showSignals and signalsAllowedByDay and showPP and showPP_tf and rawPPBuy and barstate.isconfirmed
+bool PPSell = showSignals and signalsAllowedByDay and showPP and showPP_tf and rawPPSell and barstate.isconfirmed
+
+// ─────────────────────────────────────────────────────────────────────
+// ОТРИСОВКА
+// ─────────────────────────────────────────────────────────────────────
+plotshape(SOS, title="SOS", style=shape.labelup, location=location.belowbar, color=color.new(color.orange, 100), text="SOS", textcolor=color.orange, size=size.small, force_overlay=true)
+plotshape(SOW, title="SOW", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 100), text="SOW", textcolor=color.orange, size=size.small, force_overlay=true)
+
+plotshape(SA, title="SA", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 100), text="SA", textcolor=color.green, size=size.small, force_overlay=true)
+plotshape(SOT, title="SOT", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 100), text="SOT", textcolor=color.red, size=size.small, force_overlay=true)
+
+plotshape(ND, title="ND", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 100), text="ND", textcolor=color.red, size=size.small, force_overlay=true)
+plotshape(NS, title="NS", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 100), text="NS", textcolor=color.green, size=size.small, force_overlay=true)
+
+plotshape(PPBuy, title="ПП", style=shape.labelup, location=location.belowbar, color=color.new(color.blue, 100), text="ПП", textcolor=color.blue, size=size.small, force_overlay=true)
+plotshape(PPSell, title="ПП", style=shape.labeldown, location=location.abovebar, color=color.new(color.blue, 100), text="ПП", textcolor=color.blue, size=size.small, force_overlay=true)
+
+if VBuy
+    label.new(sessMaxVolIdx, low[maxOffset], text="V", style=label.style_label_up, color=color.new(color.green, 100), textcolor=color.green, size=size.small, force_overlay=true)
+if VSell
+    label.new(sessMaxVolIdx, high[maxOffset], text="V", style=label.style_label_down, color=color.new(color.red, 100), textcolor=color.red, size=size.small, force_overlay=true)
+
+// ─────────────────────────────────────────────────────────────────────
+// АЛЕРТЫ (оповещение на открытии нового бара о сигнале [1])
+// ─────────────────────────────────────────────────────────────────────
+string sigName = ""
+
+if SOS[1]
+    sigName := "SOS Сила"
+else if SOW[1]
+    sigName := "SOW Слабость"
+else if SA[1]
+    sigName := "SA Поглощение"
+else if SOT[1]
+    sigName := "SOT Тест"
+else if ND[1]
+    sigName := "ND Нет спроса"
+else if NS[1]
+    sigName := "NS Нет предложения"
+else if VBuy[1]
+    sigName := "Перебивка V Вверх"
+else if VSell[1]
+    sigName := "Перебивка V Вниз"
+else if PPBuy[1]
+    sigName := "ПП Вверх"
+else if PPSell[1]
+    sigName := "ПП Вниз"
+
+if barstate.isnew and sigName != ""
+    string barOpen  = str.format_time(time[1], "HH:mm", syminfo.timezone)
+    string barClose = str.format_time(time_close[1], "HH:mm", syminfo.timezone)
+    string dateStr  = str.format_time(time[1], "yyyy-MM-dd", syminfo.timezone)
+    string alert_text = "🔔 <b>Сигнал QCKSLVR</b>\\n\\n"
+    alert_text += "📊 <b>Инструмент:</b> " + syminfo.ticker + "\\n"
+    alert_text += "⏱ <b>Таймфрейм:</b> " + timeframe.period + "\\n"
+    alert_text += "💰 <b>Цена закрытия:</b> " + str.tostring(close[1], format.mintick) + "\\n"
+    alert_text += "🕒 <b>Сигнальный бар:</b> " + dateStr + " " + barOpen + "–" + barClose + "\\n\\n"
+    alert_text += "⚡️ <b>Сигнал:</b> " + sigName
+
+    string json_msg = "{\"chat_id\":\"-1004347291221\",\"parse_mode\":\"HTML\",\"text\":\"" + alert_text + "\"}"
+    alert(json_msg, alert.freq_once_per_bar)
+
+alertcondition(SOS, title="Сигнал SOS", message="SOS")
+alertcondition(SOW, title="Сигнал SOW", message="SOW")
+alertcondition(SA, title="Сигнал SA", message="SA")
+alertcondition(SOT, title="Сигнал SOT", message="SOT")
+alertcondition(ND, title="Сигнал ND", message="ND")
+alertcondition(NS, title="Сигнал NS", message="NS")
+alertcondition(VBuy or VSell, title="Сигнал V", message="V")
+alertcondition(PPBuy or PPSell, title="Сигнал ПП", message="ПП")
+
+// ─────────────────────────────────────────────────────────────────────
+// ТАБЛИЦА ДИАГНОСТИКИ
+// ─────────────────────────────────────────────────────────────────────
+var table diagTable = table.new(position.bottom_right, 2, 20, border_width=1, border_color=color.gray)
+
+if showDiag and barstate.islast
+    string visStr = str.tostring(showSOS_SOW_tf) + " | " + str.tostring(showSA_SOT_tf) + " | " + str.tostring(showND_NS_tf) + " | " + str.tostring(showPP_tf)
     
-    step = (b - a) / 3
-    
-    z1_low, z1_high = min(a, a + step), max(a, a + step)
-    z2_low, z2_high = min(a + step, a + 2 * step), max(a + step, a + 2 * step)
-    z3_low, z3_high = min(a + 2 * step, b), max(a + 2 * step, b)
-    
-    boundaries = (z1_low, z1_high, z2_low, z2_high, z3_low, z3_high)
-    
-    if z1_low <= price <= z1_high:
-        return 1, boundaries
-    elif z2_low <= price <= z2_high:
-        return 2, boundaries
-    elif z3_low <= price <= z3_high:
-        return 3, boundaries
-    return None, boundaries
+    table.cell(diagTable, 0, 0, "Условие", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(diagTable, 1, 0, "Текущее", text_color=color.white, bgcolor=color.new(color.blue, 0))
 
+    table.cell(diagTable, 0, 1, "ТФ / разрешен", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 1, tf + " / " + str.tostring(sosSowAllowed), text_color=color.white, bgcolor=color.new(sosSowAllowed ? color.green : color.red, 70))
 
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ ИЗ GOOGLE SHEETS
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_sheet_data() -> tuple[float, dict]:
-    default_deposit = 100000.0
-    ticker_map = {}
-    
-    try:
-        df = pd.read_csv(SHEET_URL, header=None)
-        
-        if len(df) > 0 and len(df.columns) > 1:
-            val = parse_number(df.iloc[0, 1])
-            if val is not None and val > 0:
-                default_deposit = val
-        
-        if default_deposit == 100000.0:
-            for col_idx in range(min(4, len(df.columns))):
-                deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
-                if not deposit_rows.empty:
-                    row_idx = deposit_rows.index[0]
-                    if col_idx + 1 < len(df.columns):
-                        val = parse_number(df.iloc[row_idx, col_idx + 1])
-                        if val is not None and val > 0:
-                            default_deposit = val
-                            break
-        
-        header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
-        if not header_idx.empty:
-            idx = header_idx[0]
-            data_df = df.iloc[idx+1:].dropna(how='all')
-            data_df.columns = ["Тикер", "Тикер TW", "A", "B"]
-            
-            for _, row in data_df.iterrows():
-                t = str(row["Тикер"]).strip()
-                if t and t.lower() != "nan":
-                    tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
-                    pt_a = parse_number(row["A"])
-                    pt_b = parse_number(row["B"])
+    table.cell(diagTable, 0, 2, "Вид: S/SA/ND/ПП", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 2, visStr, text_color=color.white, bgcolor=color.new((showSOS_SOW_tf or showSA_SOT_tf or showND_NS_tf or showPP_tf) ? color.green : color.red, 70))
 
-                    direction = None
-                    if pt_a is not None and pt_b is not None:
-                        direction = "LONG" if pt_a < pt_b else "SHORT"
+    table.cell(diagTable, 0, 3, "Объем / Средний", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    float volRatio = na(volAvg) or volAvg == 0 ? na : volume / volAvg
+    table.cell(diagTable, 1, 3, (na(volRatio) ? "н/д" : str.tostring(math.round(volRatio * 10) / 10) + "×"), text_color=color.white, bgcolor=color.new(isAnomaly ? color.green : color.red, 70))
 
-                    setup = {"tw": tw_val, "a": pt_a, "b": pt_b, "dir": direction}
-                    
-                    if t not in ticker_map:
-                        ticker_map[t] = []
-                    ticker_map[t].append(setup)
-                    
-    except Exception as e:
-        st.warning(f"Не удалось загрузить данные из Google Sheets: {e}")
-        
-    return default_deposit, ticker_map
+    table.cell(diagTable, 0, 4, "Тип бара (Close/Close)", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 4, "Покупки: " + str.tostring(sigBuyBar) + " / Продажи: " + str.tostring(sigSellBar), text_color=color.white, bgcolor=color.new((sigBuyBar or sigSellBar) ? color.green : color.red, 70))
 
+    table.cell(diagTable, 0, 5, "SA/SOT: Отклонение Close", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 5, str.tostring(math.round(closeDevInPctOfRange * 10) / 10) + "% (макс " + str.tostring(saSotDevPct) + "%)", text_color=color.white, bgcolor=color.new(saSotCloseOk ? color.green : color.red, 70))
 
-# ─────────────────────────────────────────────────────────────
-# HTTP-СЕССИЯ И MOEX ISS
-# ─────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/7.0"})
-    s.mount(
-        "https://",
-        HTTPAdapter(
-            max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504)),
-            pool_maxsize=8,
-        ),
-    )
-    return s
+    table.cell(diagTable, 0, 6, "SA/SOT: Отклонение объема", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 6, str.tostring(math.round(volDevPct * 10) / 10) + "% (макс " + str.tostring(saSotDevPct) + "%)", text_color=color.white, bgcolor=color.new(saSotVolOk ? color.green : color.red, 70))
 
+    table.cell(diagTable, 0, 7, "SA/SOT: Хвосты (Низ/Верх)", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 7, str.tostring(math.round(saBuyTail * 100) / 100) + " / " + str.tostring(math.round(saSellTail * 100) / 100), text_color=color.white, bgcolor=color.new((saTailDominant or sotTailDominant) ? color.green : color.red, 70))
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_futures() -> pd.DataFrame:
-    try:
-        r = _session().get(f"{ISS}/securities.json", params={"iss.meta": "off", "iss.only": "securities,marketdata"}, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        sec = pd.DataFrame(js["securities"]["data"], columns=js["securities"]["columns"])
-        mkt = pd.DataFrame(js["marketdata"]["data"], columns=js["marketdata"]["columns"])
-    except Exception as e:
-        st.error(f"MOEX ISS недоступен: {e}")
-        return pd.DataFrame()
+    table.cell(diagTable, 0, 8, "SA/SOT: Open vs Prev Close", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    bool openCondition = (previousBarWasSelling and signalGapDown) or (previousBarWasBuying and signalGapUp)
+    table.cell(diagTable, 1, 8, str.tostring(open) + " vs " + str.tostring(close[1]), text_color=color.white, bgcolor=color.new(openCondition ? color.green : color.red, 70))
 
-    sec = sec.drop_duplicates("SECID", keep="first")
-    mkt = mkt.drop_duplicates("SECID", keep="first")
-    df = sec.merge(mkt, on="SECID", how="left")
+    table.cell(diagTable, 0, 9, "VSA: Баров от SOS/SOW", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 9, "SOS: " + str.tostring(barsSinceSOS) + " / SOW: " + str.tostring(barsSinceSOW), text_color=color.white, bgcolor=color.new(color.gray, 70))
 
-    for col in ("MINSTEP", "STEPPRICE", "INITIALMARGIN", "LAST", "PREVSETTLEPRICE"):
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    table.cell(diagTable, 0, 10, "VSA: Первые 2 бара отката", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 10, "NS: " + str.tostring(ns_firstBarsOk) + " / ND: " + str.tostring(nd_firstBarsOk), text_color=color.white, bgcolor=color.new((ns_firstBarsOk or nd_firstBarsOk) ? color.green : color.red, 70))
 
-    df = df[(df["MINSTEP"] > 0) & (df["STEPPRICE"] > 0)].copy()
-    df["PRICE"] = df["LAST"].where(df["LAST"] > 0, df["PREVSETTLEPRICE"])
-    return df
+    table.cell(diagTable, 0, 11, "VSA: Слабый объем отката", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 11, "NS: " + str.tostring(ns_volWeak) + " / ND: " + str.tostring(nd_volWeak), text_color=color.white, bgcolor=color.new((ns_volWeak or nd_volWeak) ? color.green : color.red, 70))
 
+    table.cell(diagTable, 0, 12, "VSA: Узость закрытий", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 12, "NS: " + str.tostring(ns_tight) + " / ND: " + str.tostring(nd_tight), text_color=color.white, bgcolor=color.new((ns_tight or nd_tight) ? color.green : color.red, 70))
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_ims() -> pd.DataFrame:
-    try:
-        r = _session().get(f"{ISS}/ims.json", params={"iss.meta": "off"}, timeout=15)
-        r.raise_for_status()
-        js = r.json()
-        block = js.get("ims") or {}
-        df = pd.DataFrame(block.get("data") or [], columns=block.get("columns") or [])
-        if not df.empty:
-            df.columns = [str(c).upper().strip() for c in df.columns]
-            if "BOARDID" in df.columns:
-                df = df[df["BOARDID"] == "RFUD"].copy()
-            if "SECID" in df.columns:
-                df = df.drop_duplicates("SECID", keep="first").copy()
-            for c in df.columns:
-                if c.startswith("IM_") and c != "IM_TIME":
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            return df
-    except Exception:
-        pass
+    table.cell(diagTable, 0, 13, "VSA: Понижение объема", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 13, str.tostring(volume[0] < volume[1] and volume[0] < volume[2]), text_color=color.white, bgcolor=color.new((volume[0] < volume[1] and volume[0] < volume[2]) ? color.green : color.red, 70))
 
-    try:
-        r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text), sep="|")
-        if not df.empty:
-            df.columns = [str(c).upper().strip() for c in df.columns]
-            if "BOARDID" in df.columns:
-                df = df[df["BOARDID"] == "RFUD"].copy()
-            if "SECID" in df.columns:
-                df = df.drop_duplicates("SECID", keep="first").copy()
-            for c in df.columns:
-                if c.startswith("IM_") and c != "IM_TIME":
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            return df
-    except Exception:
-        st.warning("Не удалось загрузить точные ГО. Используются базовые значения.")
-        return pd.DataFrame()
+    table.cell(diagTable, 0, 14, "VSA: Шаг закрытий", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 14, "NS: " + str.tostring(ns_stepOk) + " / ND: " + str.tostring(nd_stepOk), text_color=color.white, bgcolor=color.new((ns_stepOk or nd_stepOk) ? color.green : color.red, 70))
 
+    table.cell(diagTable, 0, 15, "SOS/SOW: Сильные объёмы", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 15, str.tostring(strongVolumeInMove) + (sosSowOnlyStrongVolume ? " (вкл)" : " (выкл)"), text_color=color.white, bgcolor=color.new(strongVolumeOk ? color.green : color.red, 70))
 
-def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) -> pd.DataFrame:
-    df = futures.copy()
-    base_margin = df["INITIALMARGIN"].fillna(0.0)
-    df["GO_LONG"] = base_margin
-    df["GO_SHORT"] = base_margin
+    table.cell(diagTable, 0, 16, "Сырой SOS / SOW", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 16, str.tostring(condSOS) + " / " + str.tostring(condSOW), text_color=color.white, bgcolor=color.new((condSOS or condSOW) ? color.green : color.gray, 70))
 
-    cols = IMS_MARGIN_MAP.get(margin_type)
-    if cols and not ims.empty and "SECID" in ims.columns:
-        col_b, col_s = cols
-        if col_b in ims.columns and col_s in ims.columns:
-            margin_map = ims.set_index("SECID")
-            df["GO_LONG"] = df["SECID"].map(margin_map[col_b]).fillna(base_margin)
-            df["GO_SHORT"] = df["SECID"].map(margin_map[col_s]).fillna(base_margin)
+    table.cell(diagTable, 0, 17, "Сырой SA / SOT", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 17, str.tostring(rawSA) + " / " + str.tostring(rawSOT), text_color=color.white, bgcolor=color.new((rawSA or rawSOT) ? color.green : color.gray, 70))
 
-    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, base_margin)
-    df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, base_margin)
-    return df
+    table.cell(diagTable, 0, 18, "Сырой ND / NS (VSA)", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(diagTable, 1, 18, str.tostring(nd_signal) + " / " + str.tostring(ns_signal), text_color=color.white, bgcolor=color.new((nd_signal or ns_signal) ? color.green : color.gray, 70))
 
-
-# ─────────────────────────────────────────────────────────────
-# INSTRUMENT
-# ─────────────────────────────────────────────────────────────
-@dataclass(slots=True)
-class Instrument:
-    ticker: str
-    name: str
-    min_step: float
-    step_price: float
-    price: float
-    go_long: float
-    go_short: float
-    expiry: str
-    decimals: int
-
-    @property
-    def point_value(self) -> float:
-        return (self.step_price / self.min_step) if self.min_step else 1.0
-
-    def margin(self, direction: str) -> float:
-        return self.go_long if direction == "LONG" else self.go_short
-
-    def round_price(self, p: float) -> float:
-        if not self.min_step:
-            return round(p, self.decimals)
-        return round(round(p / self.min_step) * self.min_step, self.decimals)
-
-
-def _decimals(step: float) -> int:
-    if step <= 0:
-        return 2
-    return max(0, min(6, int(math.ceil(-math.log10(step)))))
-
-
-def _to_instrument(row: pd.Series) -> Instrument:
-    return Instrument(
-        ticker=str(row["SECID"]),
-        name=str(row.get("SHORTNAME") or row["SECID"]),
-        min_step=float(row["MINSTEP"]),
-        step_price=float(row["STEPPRICE"]),
-        price=float(row["PRICE"]),
-        go_long=float(row["GO_LONG"]),
-        go_short=float(row["GO_SHORT"]),
-        expiry=str(row.get("LASTTRADEDATE") or "—"),
-        decimals=_decimals(float(row["MINSTEP"])),
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# СТРАНИЦА И CSS
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Калькулятор фьючерсов MOEX",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
-
-st.markdown(
-    """
-    <style>
-    @media (max-width: 640px) {
-        .block-container { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
-        .stApp > header { display: none; }
-        .mobile-col-3 > div { width: 33.33% !important; flex: 0 0 33.33% !important; padding: 0 2px !important; }
-        .mobile-col-2 > div { width: 50% !important; flex: 0 0 50% !important; padding: 0 2px !important; }
-        .stNumberInput { min-height: 2.2rem !important; }
-        .stNumberInput label { display: none !important; }
-        .stNumberInput input { height: 2.2rem !important; font-size: 14px !important; }
-        .stRadio > div { flex-direction: row !important; gap: 8px !important; }
-        .stRadio label { font-size: 13px !important; padding: 4px 8px !important; }
-        .streamlit-expanderHeader { font-size: 13px !important; padding: 0.3rem 0 !important; }
-        .stButton > button { padding: 0.3rem 0.5rem !important; font-size: 13px !important; }
-        .stSidebar h3 { font-size: 1rem !important; margin-bottom: 0.5rem !important; margin-top: 0.5rem !important; }
-        .stSidebar p { font-size: 0.8rem !important; color: #666 !important; margin-bottom: 0.8rem !important; }
-    }
-    
-    .stRadio div[role="radiogroup"] > label:has(> input[value="LONG"]) {
-        background-color: #e6f4ea !important; border: 2px solid #34a853 !important;
-        color: #137333 !important; font-weight: 600 !important; border-radius: 6px !important; padding: 8px 16px !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="SHORT"]) {
-        background-color: #fce8e6 !important; border: 2px solid #ea4335 !important;
-        color: #c5221f !important; font-weight: 600 !important; border-radius: 6px !important; padding: 8px 16px !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="LONG"]:checked) {
-        background-color: #34a853 !important; color: white !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="SHORT"]:checked) {
-        background-color: #ea4335 !important; color: white !important;
-    }
-    
-    .compact-metrics {
-        display: flex; justify-content: space-between; align-items: center;
-        background: #f0f2f6; padding: 8px 12px; border-radius: 8px;
-        font-size: 0.85rem; margin-bottom: 8px; border: 1px solid #e0e0e0;
-    }
-    .compact-metrics .item { text-align: center; flex: 1; }
-    .compact-metrics .item b { display: block; font-size: 0.7rem; color: #666; text-transform: uppercase; }
-    .compact-metrics .item span { font-size: 0.95rem; font-weight: 600; color: #0e1117; }
-    
-    .zone-indicator {
-        padding: 8px 12px; border-radius: 6px; margin: 8px 0;
-        font-size: 0.85rem; font-weight: 600;
-    }
-    .zone-1 { background: #e6f4ea; border: 1px solid #34a853; color: #137333; }
-    .zone-2 { background: #fef7e0; border: 1px solid #f9ab00; color: #b06000; }
-    .zone-3 { background: #fce8e6; border: 1px solid #ea4335; color: #c5221f; }
-    
-    .sidebar-ref {
-        background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px;
-        padding: 6px 8px; margin-top: 4px; margin-bottom: 8px;
-    }
-    .sidebar-ref-item {
-        font-size: 0.75rem; color: #495057; padding: 2px 0;
-        border-bottom: 1px dashed #dee2e6;
-    }
-    .sidebar-ref-item:last-child { border-bottom: none; }
-    .sidebar-ref-dir { font-weight: 700; }
-    .dir-long { color: #137333; }
-    .dir-short { color: #c5221f; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ─────────────────────────────────────────────────────────────
-# ИНИЦИАЛИЗАЦИЯ SESSION STATE
-# ─────────────────────────────────────────────────────────────
-sheet_deposit, sheet_ticker_map = load_sheet_data()
-
-if "deposit_initialized" not in st.session_state:
-    st.session_state.deposit_input = sheet_deposit
-    st.session_state.deposit_initialized = True
-
-if "margin_type" not in st.session_state:
-    st.session_state.margin_type = "КСУР"
-
-
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ MOEX (ДО САЙДБАРА)
-# ─────────────────────────────────────────────────────────────
-st.markdown("<h4 style='margin: 0 0 8px 0;'>Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
-
-with st.spinner("Загрузка данных..."):
-    futures = fetch_futures()
-    ims = fetch_ims()
-
-if futures.empty:
-    st.error("Не удалось загрузить список фьючерсов с MOEX ISS.")
-    st.stop()
-
-# margin_type теперь берется из session_state
-margin_type = st.session_state.margin_type
-futures = merge_margins(futures, ims, margin_type)
-futures = futures[(futures["PRICE"] > 0) & ((futures["GO_LONG"] > 0) | (futures["GO_SHORT"] > 0))].copy()
-
-if futures.empty:
-    st.warning("Нет контрактов с валидными ценой и ГО.")
-    st.stop()
-
-futures = futures.sort_values("SECID").reset_index(drop=True)
-instruments: dict[str, Instrument] = {row["SECID"]: _to_instrument(row) for _, row in futures.iterrows()}
-
-
-def format_ticker(t: str) -> str:
-    setups = sheet_ticker_map.get(t, [])
-    tw = setups[0]["tw"] if setups and setups[0]["tw"] else ""
-    return f"{t} ({tw})" if tw else t
-
-ticker = st.selectbox(
-    "Фьючерс", list(instruments.keys()),
-    format_func=format_ticker,
-    label_visibility="collapsed",
-    key="ticker_select"
-)
-
-if "last_ticker" not in st.session_state:
-    st.session_state.last_ticker = ticker
-elif st.session_state.last_ticker != ticker:
-    for key in TRADE_STATE_KEYS:
-        if key in st.session_state:
-            del st.session_state[key]
-    st.session_state.last_ticker = ticker
-
-inst = instruments[ticker]
-
-
-# ─────────────────────────────────────────────────────────────
-# САЙДБАР (ПОСЛЕ ЗАГРУЗКИ inst)
-# ─────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Депозит и риск на сделку")
-    st.markdown("Основные параметры для расчёта объёма позиции.")
-    
-    deposit = st.number_input(
-        "Депозит, руб.", min_value=0.0, 
-        step=1000.0, format="%.0f", key="deposit_input"
-    )
-    
-    st.markdown(
-        f"<div class='sidebar-ref'><div class='sidebar-ref-item'>Из таблицы (B1): <b>{fmt_n(sheet_deposit, 0)} руб.</b></div></div>",
-        unsafe_allow_html=True
-    )
-    
-    risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
-    
-    st.divider()
-    
-    st.header("Лимиты загрузки и RR")
-    st.markdown("Контроль нагрузки на депозит и минимальное соотношение риск/прибыль.")
-    
-    margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
-    required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
-    
-    # margin_type теперь синхронизируется через session_state
-    margin_type = st.selectbox(
-        "Категория риска (ГО)", 
-        MARGIN_LEVELS, 
-        index=MARGIN_LEVELS.index(st.session_state.margin_type),
-        format_func=lambda x: MARGIN_HINTS.get(x, x),
-        key="margin_type"
-    )
-    
-    st.divider()
-    
-    st.header("Зоны риска A-B")
-    st.markdown("Введите значения вручную, опираясь на справку ниже.")
-    
-    point_a = st.number_input(
-        "Точка A", value=None, step=1.0, format="%.2f", placeholder="Цена точки A", key="point_a_input"
-    )
-    point_b = st.number_input(
-        "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
-    )
-    
-    st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
-    
-    current_ticker = st.session_state.get("ticker_select", "")
-    setups = sheet_ticker_map.get(current_ticker, [])
-    
-    if setups:
-        ref_html = "<div class='sidebar-ref'>"
-        for s in setups:
-            dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
-            dir_text = s.get("dir") or "N/A"
-            a_text = fmt_n(s["a"], inst.decimals) if s["a"] is not None else "—"
-            b_text = fmt_n(s["b"], inst.decimals) if s["b"] is not None else "—"
-            ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
-        ref_html += "</div>"
-        st.markdown(ref_html, unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='sidebar-ref'><div class='sidebar-ref-item'>Данных для этого тикера нет</div></div>", unsafe_allow_html=True)
-    
-    st.divider()
-    if st.button("Обновить котировки", use_container_width=True):
-        fetch_futures.clear()
-        fetch_ims.clear()
-        load_sheet_data.clear()
-        st.rerun()
-
-
-# ─────────────────────────────────────────────────────────────
-# ОСНОВНОЙ ИНТЕРФЕЙС (ПРОДОЛЖЕНИЕ)
-# ─────────────────────────────────────────────────────────────
-st.markdown(
-    f"""
-    <div class="compact-metrics">
-        <div class="item"><b>Цена</b><span>{fmt_n(inst.price, inst.decimals)}</span></div>
-        <div class="item"><b>Шаг / Ст</b><span>{fmt_n(inst.min_step, inst.decimals)} / {fmt_n(inst.step_price, 2)} руб.</span></div>
-        <div class="item"><b>ГО ({margin_type})</b><span>L: {fmt_n(inst.go_long, 0)} / S: {fmt_n(inst.go_short, 0)} руб.</span></div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-current_zone, _ = determine_zone(inst.price, point_a, point_b)
-if current_zone is not None:
-    zone_class = f"zone-{current_zone}"
-    zone_text = {1: "Зона 1 (Идеальная)", 2: "Зона 2 (Повышенный риск)", 3: "Зона 3 (Запрещена)"}
-    st.markdown(f'<div class="zone-indicator {zone_class}">Текущая цена в {zone_text[current_zone]}</div>', unsafe_allow_html=True)
-else:
-    st.caption(f"1 пункт = {fmt_n(inst.point_value, 2)} руб. | Экспирация: {fmt_date(inst.expiry)}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ПАРАМЕТРЫ СДЕЛКИ
-# ─────────────────────────────────────────────────────────────
-direction = st.radio(
-    "Направление", ["LONG", "SHORT"], horizontal=True, index=0, 
-    label_visibility="collapsed", key="direction_radio"
-)
-sign = 1 if direction == "LONG" else -1
-
-fmt_in = f"%.{inst.decimals}f"
-step_ui = float(inst.min_step) if inst.min_step > 0 else 0.01
-
-st.markdown("<div style='font-size: 0.85rem; font-weight: 600; margin-bottom: 4px;'>Уровни цены</div>", unsafe_allow_html=True)
-c1, c2 = st.columns(2, gap="small")
-sl = c1.number_input("SL", value=None, step=step_ui, format=fmt_in, placeholder="Стоп-лосс", label_visibility="collapsed", key="sl_input")
-tp = c2.number_input("TP", value=None, step=step_ui, format=fmt_in, placeholder="Тейк-профит", label_visibility="collapsed", key="tp_input")
-
-st.markdown("<div style='font-size: 0.85rem; font-weight: 600; margin: 8px 0 4px 0;'>Точка входа</div>", unsafe_allow_html=True)
-ec1, ec2 = st.columns([3, 2], gap="small")
-p1 = ec1.number_input("Цена 1", value=None, step=step_ui, format=fmt_in, placeholder="Цена входа", label_visibility="collapsed", key="entry_p_0")
-q1 = ec2.number_input("Контр. 1", min_value=0, value=None, step=1, format="%d", placeholder="Кол-во", label_visibility="collapsed", key="entry_q_0")
-
-entries = []
-if p1 is not None:
-    entries.append({"price": p1, "qty": q1 if q1 is not None else 0})
-
-with st.expander("Добавить усреднение (до 3 точек)", expanded=False):
-    for i in range(1, 3):
-        ec1, ec2 = st.columns([3, 2], gap="small")
-        p = ec1.number_input(f"Цена {i+1}", value=None, step=step_ui, format=fmt_in, placeholder=f"Цена входа {i+1}", label_visibility="collapsed", key=f"entry_p_{i}")
-        q = ec2.number_input(f"Контр. {i+1}", min_value=0, value=None, step=1, format="%d", placeholder=f"Кол-во {i+1}", label_visibility="collapsed", key=f"entry_q_{i}")
-        if p is not None:
-            entries.append({"price": p, "qty": q if q is not None else 0})
-
-with_qty = [e for e in entries if e["qty"] > 0]
-
-if with_qty:
-    entries_qty_sum = sum(e["qty"] for e in with_qty)
-    avg_entry = sum(e["price"] * e["qty"] for e in with_qty) / entries_qty_sum
-elif entries:
-    avg_entry = entries[0]["price"]
-    entries_qty_sum = 0
-else:
-    avg_entry = None
-    entries_qty_sum = 0
-
-effective_qty = entries_qty_sum
-
-if avg_entry is not None and sl is not None and avg_entry != sl:
-    risk_pts = abs(avg_entry - sl)
-    raw_min_tp = avg_entry + sign * risk_pts * required_rr
-    min_tp = inst.round_price(raw_min_tp)
-    st.info(f"Мин. TP для RR 1:{fmt_n(required_rr, 1)} -> {fmt_n(min_tp, inst.decimals)}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ВАЛИДАЦИЯ И РЕЗУЛЬТАТ
-# ─────────────────────────────────────────────────────────────
-have_prices = avg_entry is not None and sl is not None and tp is not None
-have_qty = effective_qty > 0
-warnings = []
-
-entry_zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
-zone_blocked = False
-zone_reduction = 1.0
-zone_message = None
-
-if entry_zone is not None and point_a is not None and point_b is not None:
-    if direction == "LONG" and entry_zone == 3:
-        zone_blocked = True
-        zone_message = "ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для LONG. Высокий риск."
-    elif direction == "SHORT" and entry_zone == 1:
-        zone_blocked = True
-        zone_message = "ЗАПРЕЩЕНО: вход в зоне 1 (у точки A) для SHORT. Высокий риск."
-    elif entry_zone == 2:
-        zone_reduction = 0.5
-        zone_message = "Повышенный риск: зона 2. Рекомендуется сократить объём на 50%."
-    else:
-        zone_message = f"Зона {entry_zone}: оптимальная для {direction}."
-
-if have_prices:
-    if direction == "LONG":
-        if sl >= avg_entry: warnings.append("SL должен быть ниже цены входа")
-        if tp <= avg_entry: warnings.append("TP должен быть выше цены входа")
-    else:
-        if sl <= avg_entry: warnings.append("SL должен быть выше цены входа")
-        if tp >= avg_entry: warnings.append("TP должен быть ниже цены входа")
-
-for w in warnings:
-    st.warning(w)
-
-if entry_zone is not None and zone_message:
-    zone_class = f"zone-{entry_zone}"
-    st.markdown(f'<div class="zone-indicator {zone_class}">{zone_message}</div>', unsafe_allow_html=True)
-
-st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-
-if zone_blocked:
-    st.error(zone_message)
-elif not have_prices:
-    st.info("Заполните цену входа, SL и TP для расчёта.")
-elif not have_qty:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    st.markdown(f"<div class='compact-metrics'><div class='item' style='flex:1'><b>Расчётный RR</b><span style='color: #0068c9'>{fmt_n(rr, 2)}</span></div></div>", unsafe_allow_html=True)
-    st.caption("Укажите количество контрактов для расчёта объёма и риска.")
-else:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-
-    sl_steps = sl_dist / inst.min_step
-    tp_steps = tp_dist / inst.min_step
-    risk_per_ct = sl_steps * inst.step_price
-    profit_per_ct = tp_steps * inst.step_price
-
-    margin = inst.margin(direction)
-    risk_budget = deposit * risk_pct / 100
-
-    qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
-    qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
-    qty_rec = min(qty_by_risk, qty_by_margin)
-    
-    qty_rec = int(qty_rec * zone_reduction)
-
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    total_risk = risk_per_ct * effective_qty
-    total_reward = profit_per_ct * effective_qty
-
-    rr_ok = (rr >= required_rr) and (sl_dist > 0) and (tp_dist > 0)
-    mm_ok = (effective_qty <= qty_rec) and not warnings and effective_qty > 0
-
-    st.markdown(
-        f"""
-        <div class="compact-metrics" style="background: #e8f4f8; border: 1px solid #d0e8f2;">
-            <div class="item"><b>RR</b><span style="color: {'#00cc00' if rr_ok else '#ff4b4b'}">{fmt_n(rr, 2)}</span></div>
-            <div class="item"><b>Риск/конт</b><span>{fmt_n(risk_per_ct, 0)} руб.</span></div>
-            <div class="item"><b>Реком. объём</b><span style="color: #0068c9">{fmt_n(qty_rec, 0)}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not mm_ok or not rr_ok:
-        if warnings:
-            st.error("Некорректные цены сделки")
-        elif effective_qty > qty_rec:
-            st.error(f"Объём {effective_qty} > реком. {qty_rec}")
-        elif not rr_ok:
-            ratio = rr / required_rr
-            safe_qty = int(math.floor(qty_rec * ratio))
-            if safe_qty < 1:
-                st.warning("RR слишком низкий. Рекомендуется пропустить сделку.")
-            elif effective_qty <= safe_qty:
-                st.info(f"RR ниже плана, но объём {effective_qty} <= безопасного {safe_qty}")
-            else:
-                new_risk = risk_per_ct * safe_qty
-                st.warning(f"Сократите до {safe_qty} конт. (риск снизится до {fmt_n(new_risk, 0)} руб.)")
-    else:
-        st.success(f"Сделка корректна: {effective_qty} конт. <= {qty_rec}, RR = {fmt_n(rr, 2)}")
-
-    with st.expander("Детали расчёта", expanded=False):
-        actual_risk_pct = (total_risk / deposit * 100) if deposit else 0
-        risk_exceeded = actual_risk_pct > risk_pct
-        risk_color = "#ea4335" if risk_exceeded else "#0e1117"
-        risk_style = f"color: {risk_color}; font-weight: 700;" if risk_exceeded else ""
-        
-        zone_info = ""
-        if entry_zone is not None and zone_boundaries is not None:
-            z1_low, z1_high, z2_low, z2_high, z3_low, z3_high = zone_boundaries
-            zone_info = f"""
-**Зоны риска A-B:**
-- Зона 1 (идеальная): {fmt_n(z1_low, inst.decimals)} — {fmt_n(z1_high, inst.decimals)}
-- Зона 2 (повышенный риск): {fmt_n(z2_low, inst.decimals)} — {fmt_n(z2_high, inst.decimals)}
-- Зона 3 (запрещена): {fmt_n(z3_low, inst.decimals)} — {fmt_n(z3_high, inst.decimals)}
-- Точка входа в зоне: **{entry_zone}**
-"""
-        
-        st.markdown(
-            f"""
-**Вход:** {fmt_n(avg_entry, inst.decimals)} | **Контрактов:** {fmt_n(effective_qty, 0)}
-
-**SL:** {fmt_n(sl_dist, inst.decimals)} пт = {fmt_n(sl_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(risk_per_ct, 2)} руб. / конт.**
-**TP:** {fmt_n(tp_dist, inst.decimals)} пт = {fmt_n(tp_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(profit_per_ct, 2)} руб. / конт.**
-
-**Бюджет риска:** {fmt_n(deposit, 0)} руб. x {fmt_n(risk_pct, 1)}% = **{fmt_n(risk_budget, 0)} руб.**
-**Qty по риску:** {fmt_n(qty_by_risk, 0)} конт. | **Qty по ГО:** {fmt_n(qty_by_margin, 0)} конт.
-{f'**Корректировка зоны:** x{zone_reduction} (зона 2)' if zone_reduction < 1.0 else ''}
-
-**Итог на {fmt_n(effective_qty, 0)} конт.:**
-- Прибыль при TP: **+{fmt_n(total_reward, 2)} руб.**
-- Убыток при SL: **-{fmt_n(total_risk, 2)} руб.**
-- Фактический риск: <span style="{risk_style}">**{fmt_n(actual_risk_pct, 2)}%** от депозита</span>{' (ПРЕВЫШАЕТ УСТАНОВЛЕННЫЙ РИСК)' if risk_exceeded else ''}
-
-{zone_info}
-*Источник данных ГО: таблица клиринга MOEX ISS (параметр {margin_type})*
-""",
-            unsafe_allow_html=True,
-        )
+    table.cell(diagTable, 0, 19, "Сырой V / ПП", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    string vText = rawVBuy ? "Buy" : rawVSell ? "Sell" : "No"
+    string ppText = rawPPBuy ? "Buy" : rawPPSell ? "Sell" : "No"
+    table.cell(diagTable, 1, 19, vText + " / " + ppText, text_color=color.white, bgcolor=color.new((rawVBuy or rawVSell or rawPPBuy or rawPPSell) ? color.green : color.gray, 70))
