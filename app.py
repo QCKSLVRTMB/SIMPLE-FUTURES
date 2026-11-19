@@ -144,7 +144,6 @@ def determine_zone(price, a, b) -> tuple[int | None, dict | None]:
         info["outside"] = "below" if price < lo else "above"
         return None, info
     info["outside"] = None
-    
     if a < b:
         z = 1 if price <= p1 else (2 if price <= p2 else 3)
     else:
@@ -269,7 +268,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/9.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/10.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -483,9 +482,8 @@ def zone_ladder_html(info: dict, price: float, level: float | None,
     bands = band(a, p1, 1) + band(p1, p2, 2) + band(p2, b, 3)
 
     oor = info.get("outside") is not None
-    py = y(price)
     price_line = (
-        f'<div class="lad-price{" oor" if oor else ""}" style="top:{py:.3f}%">'
+        f'<div class="lad-price{" oor" if oor else ""}" style="top:{y(price):.3f}%">'
         f'<span class="dot"></span></div>'
     )
 
@@ -497,8 +495,8 @@ def zone_ladder_html(info: dict, price: float, level: float | None,
             f'<span>{BELL if lvl_state == "reached" else ""}</span></div>'
         )
 
-    top_label = ("B" if long else "A")
-    bot_label = ("A" if long else "B")
+    top_label = "B" if long else "A"
+    bot_label = "A" if long else "B"
     mid_hi_v, mid_lo_v = (p2, p1) if long else (p1, p2)
 
     axis = (
@@ -563,6 +561,20 @@ html,body,[class*="css"]{
 }
 .app-title .pulse b{color:#FFD27A;}
 
+/* ── фильтр списка ── */
+div[data-testid="stCheckbox"]{min-height:0;}
+div[data-testid="stCheckbox"] label{align-items:center;gap:7px;}
+div[data-testid="stCheckbox"] label p{
+  font-size:.72rem!important;font-weight:700;color:var(--ink2);letter-spacing:.2px;}
+div[data-testid="stCheckbox"] input[type="checkbox"]{accent-color:var(--info);}
+div[data-testid="stCheckbox"] label span:first-of-type{border-color:#B7C3D8!important;}
+div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
+  background:linear-gradient(140deg,var(--info),#3B6BF0)!important;
+  border-color:var(--info)!important;}
+.filter-chips{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end;align-items:center;
+  height:100%;padding-top:2px;}
+
+/* ── метрики ── */
 .strip{
   display:flex;background:var(--surface);border:1px solid var(--line);
   border-radius:9px;overflow:hidden;margin-bottom:8px;
@@ -575,6 +587,7 @@ html,body,[class*="css"]{
   color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .strip.tint{background:linear-gradient(96deg,#EEF3FF 0%,#F4FAF7 100%);}
 
+/* ── рабочий стол: лестница + статус ── */
 .desk{display:grid;grid-template-columns:146px 1fr;gap:10px;align-items:stretch;margin-bottom:8px;}
 .ladder{display:flex;gap:6px;height:126px;background:var(--surface);
   border:1px solid var(--line);border-radius:9px;padding:8px 8px 8px 9px;}
@@ -630,12 +643,14 @@ html,body,[class*="css"]{
 }
 .hit-banner .b{font-size:.9rem;}
 
+/* ── поля ── */
 .lbl{font-size:.6rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
   color:var(--muted);margin:6px 0 3px;}
 div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-numeric:tabular-nums;}
 .stSelectbox div[data-baseweb="select"]>div{border-radius:8px;}
 .stSelectbox span{font-family:var(--mono);font-size:.82rem;}
 
+/* ── LONG / SHORT ── */
 .stRadio div[role="radiogroup"]{gap:8px;}
 .stRadio div[role="radiogroup"]>label{
   border-radius:8px;padding:6px 18px!important;font-weight:700;letter-spacing:.4px;
@@ -653,6 +668,7 @@ div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-nume
   box-shadow:0 5px 14px -7px rgba(224,36,36,.9);transform:translateY(-1px);}
 .stRadio div[role="radiogroup"]>label p{font-size:.8rem;font-weight:700;}
 
+/* ── чипы результата ── */
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 7px;}
 .chip{font-family:var(--mono);font-size:.7rem;font-weight:700;border-radius:999px;
   padding:3px 10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);
@@ -661,7 +677,9 @@ div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-nume
 .chip.bad{background:var(--short-soft);border-color:#EFB3B3;color:var(--short-deep);}
 .chip.warn{background:var(--warn-soft);border-color:#EBC98A;color:#8A5308;}
 .chip.info{background:var(--info-soft);border-color:#B9C6F7;color:#1E3A8A;}
+.chip.mini{font-size:.62rem;padding:2px 8px;}
 
+/* ── сайдбар ── */
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#FFFFFF 0%,#F5F8FD 100%);
   border-right:1px solid var(--line);}
 section[data-testid="stSidebar"] h2{font-size:.86rem!important;font-weight:700;color:var(--ink);
@@ -721,6 +739,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   div[data-testid="stNumberInput"] input{height:2.15rem!important;font-size:14px!important;}
   div[data-testid="stNumberInput"]{min-height:2.15rem!important;}
   div[data-testid="stNumberInput"] button{display:none!important;}
+  div[data-testid="stCheckbox"] label p{font-size:.68rem!important;}
   .stRadio>div{flex-direction:row!important;}
   .stButton>button{padding:.24rem .4rem!important;font-size:.68rem!important;}
   .streamlit-expanderHeader{font-size:.7rem!important;padding:.25rem 0!important;}
@@ -730,6 +749,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .lad-tick{font-size:.56rem;}
   .strip .v{font-size:.78rem;}
   .app-title h1{font-size:.86rem;}
+  .chip.mini{font-size:.58rem;padding:1px 6px;}
 }
 @media (max-width:360px){
   .desk{grid-template-columns:118px 1fr;}
@@ -745,6 +765,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 # ─────────────────────────────────────────────────────────────
 sheet_deposit, sheet_map, sheet_meta = load_sheet_data()
 
+level_cells = sum(1 for ss in sheet_map.values() for s in ss if s.get("level") is not None)
 st.markdown(
     f"""
 <div class="app-title">
@@ -752,7 +773,7 @@ st.markdown(
     <h1>Калькулятор фьючерсов MOEX</h1>
     <div class="sub">FORTS · RISK DESK · ZONES A/B</div>
   </div>
-  <div class="pulse">уровни <b>{sum(1 for t, ss in sheet_map.items() for s in ss if s.get('level') is not None)}</b></div>
+  <div class="pulse">уровни <b>{level_cells}</b></div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -786,14 +807,44 @@ summary_all = build_summary(instruments, sheet_map)
 hot_tickers = {x["ticker"] for x in summary_all if x["state"] == "reached"}
 hot_count = sum(1 for x in summary_all if x["state"] == "reached")
 
+all_tickers = list(instruments.keys())
+sheet_tickers = [t for t in all_tickers if t in sheet_map]
+missing_tickers = [t for t in sheet_map if t not in instruments]
+
 
 # ─────────────────────────────────────────────────────────────
-# ВЫБОР ИНСТРУМЕНТА (маркер уровня прямо в списке)
+# ФИЛЬТР СПИСКА + ВЫБОР ИНСТРУМЕНТА
 # ─────────────────────────────────────────────────────────────
+fcol, ccol = st.columns([1.18, 1], gap="small")
+only_sheet = fcol.checkbox(
+    "Только тикеры из таблицы",
+    value=bool(st.session_state.get("only_sheet_tickers", False)),
+    key="only_sheet_tickers",
+    help="Оставить в списке только фьючерсы, присутствующие в Google Sheets",
+)
+
+filter_active = only_sheet and bool(sheet_tickers)
+options = sheet_tickers if filter_active else all_tickers
+
+chips = [f'<span class="chip mini info">в списке {len(options)}</span>']
+if sheet_tickers:
+    chips.append(f'<span class="chip mini">таблица {len(sheet_tickers)}</span>')
+if hot_count:
+    chips.append(f'<span class="chip mini warn">{BELL} {hot_count}</span>')
+ccol.markdown(f'<div class="filter-chips">{"".join(chips)}</div>', unsafe_allow_html=True)
+
+if only_sheet and not sheet_tickers:
+    st.warning("В таблице нет тикеров, доступных в текущем списке MOEX — показан полный список.")
+elif filter_active and missing_tickers:
+    st.caption(
+        f"Не найдены в ISS (истёкшие или иные коды): {', '.join(sorted(missing_tickers)[:8])}"
+        + (" …" if len(missing_tickers) > 8 else "")
+    )
+
+
 def format_ticker(t: str) -> str:
-    setups = sheet_map.get(t, [])
     tw = ""
-    for s in setups:
+    for s in sheet_map.get(t, []):
         if s.get("tw"):
             tw = s["tw"]
             break
@@ -801,9 +852,18 @@ def format_ticker(t: str) -> str:
     return f"{base} {BELL}" if t in hot_tickers else base
 
 
+prev_sel = st.session_state.get("ticker_select")
+if prev_sel in options:
+    sel_index = options.index(prev_sel)
+else:
+    st.session_state.pop("ticker_select", None)
+    preferred = next((t for t in options if t in hot_tickers), options[0])
+    sel_index = options.index(preferred)
+
 ticker = st.selectbox(
     "Фьючерс",
-    list(instruments.keys()),
+    options,
+    index=sel_index,
     format_func=format_ticker,
     label_visibility="collapsed",
     key="ticker_select",
@@ -878,9 +938,9 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    fcol, scol = st.columns([1, 1], gap="small")
-    only_hot = fcol.checkbox("Только уровни", key="sum_only_hot")
-    sort_mode = scol.selectbox(
+    fcol2, scol2 = st.columns([1, 1], gap="small")
+    only_hot = fcol2.checkbox("Только уровни", key="sum_only_hot")
+    sort_mode = scol2.selectbox(
         "Сортировка", ["По сигналу", "По зоне", "По тикеру"],
         key="sum_sort", label_visibility="collapsed",
     )
@@ -892,12 +952,7 @@ with st.sidebar:
         rows = []
         for x in items:
             zn = ZONE_EMOJI.get(x["zone"], "▫️")
-            if x["zone"] is None:
-                zn = "▫️"
-            
-            # ИСПРАВЛЕННАЯ СТРОКА (добавлен else)
-            tw = f'<span class="tw">{x["tw"]}</span>' if x.get("tw") else '<span class="tw"></span>'
-            
+            tw = f'<span class="tw">{x["tw"]}</span>' if x["tw"] else '<span class="tw"></span>'
             mark = ""
             if x["state"] == "reached":
                 mark = f'<span class="bell">{BELL} {fmt_px(x["level"], x["decimals"])}</span>'
@@ -981,9 +1036,10 @@ with st.sidebar:
     ims_note = "IMS подключён" if not ims.empty else "IMS недоступен — базовое ГО"
     sheet_note = "таблица OK" if sheet_meta["ok"] else "таблица недоступна"
     lvl_note = "колонка «уровень» найдена" if sheet_meta["level_col"] else "колонки «уровень» нет"
+    scope_note = "список: таблица" if filter_active else "список: все фьючерсы"
     st.markdown(
         f'<div class="meta-note">котировки {fmt_clock(fut_ts)} · таблица {fmt_clock(sheet_meta["ts"])}<br>'
-        f'{len(instruments)} контрактов · {ims_note}<br>{sheet_note} · {lvl_note}</div>',
+        f'{len(instruments)} контрактов · {scope_note}<br>{ims_note}<br>{sheet_note} · {lvl_note}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1025,7 +1081,6 @@ else:
 cur_zone, cur_info = (determine_zone(inst.price, src_a, src_b)
                       if src_a is not None else (None, None))
 
-# уровень, привязанный к активному диапазону
 cur_level, cur_lvl_state = None, "none"
 if active_setup is not None:
     cur_level = active_setup.get("level")
@@ -1049,8 +1104,9 @@ if cur_zone:
     zcard = (f'<div class="zone-card z{cur_zone}"><span class="zn">{ZONE_EMOJI[cur_zone]} {zt}</span>'
              f'<span class="zl">{zl} · цена {fmt_px(inst.price, dec)}</span></div>')
 elif cur_info:
-    side = "ниже A" if cur_info["dir"] == "LONG" else "выше A"
-    if cur_info.get("outside") == "above":
+    if cur_info.get("outside") == "below":
+        side = "ниже A" if cur_info["dir"] == "LONG" else "выше A"
+    else:
         side = "выше B" if cur_info["dir"] == "LONG" else "ниже B"
     zcard = (f'<div class="zone-card z0"><span class="zn">▫️ Вне диапазона</span>'
              f'<span class="zl">цена {side} · {fmt_px(inst.price, dec)}</span></div>')
@@ -1059,16 +1115,16 @@ else:
              '<span class="zl">зона не определена</span></div>')
 
 if cur_level is not None:
+    eff_dir = (active_setup or {}).get("dir") or ("LONG" if src_a < src_b else "SHORT")
     if cur_lvl_state == "reached":
-        cmp = "≤" if (active_setup or {}).get("dir", "LONG" if src_a and src_b and src_a < src_b else "SHORT") == "LONG" else "≥"
+        cmp = "≤" if eff_dir == "LONG" else "≥"
         lvl_html = (f'<div class="lvl-line hit">{BELL} уровень {fmt_px(cur_level, dec)} '
                     f'отработан ({cmp})</div>')
     elif cur_lvl_state == "expired":
         lvl_html = f'<div class="lvl-line off">уровень {fmt_px(cur_level, dec)} снят — цена за A</div>'
     else:
-        dist = abs(inst.price - cur_level)
         lvl_html = (f'<div class="lvl-line">уровень {fmt_px(cur_level, dec)} · '
-                    f'ждать {fmt_px(dist, dec)}</div>')
+                    f'ждать {fmt_px(abs(inst.price - cur_level), dec)}</div>')
 else:
     lvl_html = (f'<div class="lvl-line off">1 пункт = {fmt_n(inst.point_value, 2)} ₽ · '
                 f'эксп. {fmt_date(inst.expiry)}</div>')
@@ -1081,8 +1137,7 @@ st.markdown(
 )
 
 for s in setups:
-    stt = level_state(inst.price, s)
-    if stt == "reached":
+    if level_state(inst.price, s) == "reached":
         cmp = "≤" if s["dir"] == "LONG" else "≥"
         st.markdown(
             f'<div class="hit-banner"><span class="b">{BELL}</span>'
@@ -1247,10 +1302,6 @@ else:
     mm_ok = effective_qty <= qty_rec and not warnings and effective_qty > 0
     risk_exceeded = actual_risk_pct > risk_pct + 1e-9
 
-    rr_cls = "ok" if rr_ok else "bad"
-    mm_cls = "ok" if mm_ok else "bad"
-    risk_cls = "bad" if risk_exceeded else "ok"
-
     st.markdown(
         f"""
 <div class="strip tint">
@@ -1259,9 +1310,9 @@ else:
   <div class="cell"><span class="k">Реком. объём</span><span class="v" style="color:#1E3A8A">{fmt_n(qty_rec, 0)}</span></div>
 </div>
 <div class="chips">
-  <span class="chip {rr_cls}">RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
-  <span class="chip {mm_cls}">MM {fmt_n(effective_qty, 0)} {'≤' if mm_ok else '&gt;'} {fmt_n(qty_rec, 0)}</span>
-  <span class="chip {risk_cls}">риск {fmt_n(actual_risk_pct, 2)}% / лимит {fmt_n(risk_pct, 2)}%</span>
+  <span class="chip {'ok' if rr_ok else 'bad'}">RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
+  <span class="chip {'ok' if mm_ok else 'bad'}">MM {fmt_n(effective_qty, 0)} {'≤' if mm_ok else '&gt;'} {fmt_n(qty_rec, 0)}</span>
+  <span class="chip {'bad' if risk_exceeded else 'ok'}">риск {fmt_n(actual_risk_pct, 2)}% / лимит {fmt_n(risk_pct, 2)}%</span>
 </div>
 """,
         unsafe_allow_html=True,
