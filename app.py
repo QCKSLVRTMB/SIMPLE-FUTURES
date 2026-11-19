@@ -268,7 +268,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/10.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/11.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -520,7 +520,7 @@ def zone_ladder_html(info: dict, price: float, level: float | None,
 # СТРАНИЦА
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Калькулятор фьючерсов MOEX",
+    page_title="Калькулятор фьючерсов QCKSLVR TRADING",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -552,12 +552,14 @@ html,body,[class*="css"]{
   background:linear-gradient(104deg,var(--ink) 0%,var(--ink2) 46%,#22357A 100%);
   color:#fff;border-radius:10px;padding:8px 12px;margin-bottom:9px;
   box-shadow:0 6px 18px -10px rgba(11,18,32,.75);
+  flex-wrap:wrap;
 }
-.app-title h1{font-size:.95rem;font-weight:700;margin:0;letter-spacing:.2px;}
+.app-title h1{font-size:.95rem;font-weight:700;margin:0;letter-spacing:.2px;flex:1;min-width:0;}
 .app-title .sub{font-size:.63rem;color:#9FB2D8;font-family:var(--mono);letter-spacing:.4px;}
 .app-title .pulse{
   font-size:.63rem;font-family:var(--mono);background:rgba(255,255,255,.10);
   border:1px solid rgba(255,255,255,.20);border-radius:999px;padding:2px 8px;color:#DCE6FF;
+  white-space:nowrap;
 }
 .app-title .pulse b{color:#FFD27A;}
 
@@ -735,6 +737,13 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 @media (max-width:640px){
   .block-container{padding-top:.45rem!important;padding-bottom:.6rem!important;}
   .stApp>header{display:none;}
+  
+  /* Адаптация заголовка для мобильных */
+  .app-title{padding:6px 10px;gap:6px;margin-bottom:7px;}
+  .app-title h1{font-size:.78rem;line-height:1.2;}
+  .app-title .sub{font-size:.55rem;}
+  .app-title .pulse{font-size:.55rem;padding:2px 6px;}
+  
   div[data-testid="stNumberInput"] label{display:none!important;}
   div[data-testid="stNumberInput"] input{height:2.15rem!important;font-size:14px!important;}
   div[data-testid="stNumberInput"]{min-height:2.15rem!important;}
@@ -748,12 +757,14 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .lad-bar{width:30px;flex:0 0 30px;}
   .lad-tick{font-size:.56rem;}
   .strip .v{font-size:.78rem;}
-  .app-title h1{font-size:.86rem;}
   .chip.mini{font-size:.58rem;padding:1px 6px;}
 }
 @media (max-width:360px){
   .desk{grid-template-columns:118px 1fr;}
   .lad-tick{font-size:.52rem;}
+  .app-title h1{font-size:.72rem;}
+  .app-title .sub{font-size:.5rem;}
+  .app-title .pulse{font-size:.5rem;padding:1px 5px;}
 }
 </style>
 """,
@@ -770,7 +781,7 @@ st.markdown(
     f"""
 <div class="app-title">
   <div>
-    <h1>Калькулятор фьючерсов MOEX</h1>
+    <h1>Калькулятор фьючерсов QCKSLVR TRADING</h1>
     <div class="sub">FORTS · RISK DESK · ZONES A/B</div>
   </div>
   <div class="pulse">уровни <b>{level_cells}</b></div>
