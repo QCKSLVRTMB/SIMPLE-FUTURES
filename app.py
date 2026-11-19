@@ -84,7 +84,6 @@ def parse_number(val) -> float | None:
 
 
 def fmt_px(v, decimals: int = 2) -> str:
-    """Цена: ровно столько знаков, сколько требует спецификация ISS."""
     try:
         v = float(v)
     except (TypeError, ValueError):
@@ -96,7 +95,6 @@ def fmt_px(v, decimals: int = 2) -> str:
 
 
 def fmt_n(v, decimals: int = 0) -> str:
-    """Деньги и количества: без лишних нулей."""
     try:
         v = float(v)
     except (TypeError, ValueError):
@@ -133,7 +131,6 @@ def zone_bands(a: float, b: float) -> tuple[float, float]:
 
 
 def determine_zone(price, a, b) -> tuple[int | None, dict | None]:
-    """Зона 1 всегда у A, зона 3 всегда у B. Направление задаётся порядком A и B."""
     if price is None or a is None or b is None or a == b:
         return None, None
     p1, p2 = zone_bands(a, b)
@@ -152,12 +149,6 @@ def determine_zone(price, a, b) -> tuple[int | None, dict | None]:
 
 
 def level_state(price, setup: dict) -> str:
-    """
-    'reached' — уровень отработан (LONG: цена <= уровня, SHORT: цена >= уровня)
-    'expired' — цена ушла за точку A, уровень снят
-    'armed'   — уровень ждёт отработки
-    'none'    — данных недостаточно
-    """
     lvl, a, d = setup.get("level"), setup.get("a"), setup.get("dir")
     if price is None or lvl is None or a is None or d is None:
         return "none"
@@ -193,13 +184,11 @@ def load_sheet_data() -> tuple[float, dict, dict]:
         meta["error"] = "таблица пуста"
         return deposit, tmap, meta
 
-    # Депозит — ячейка B1
     if raw.shape[1] > 1:
         v = parse_number(raw.iloc[0, 1])
         if v is not None and v > 0:
             deposit = v
 
-    # Резерв: слово «Депозит» в любой из первых колонок
     if deposit == 100_000.0:
         for c in range(min(4, raw.shape[1])):
             hit = raw[raw[c].map(_norm).str.contains("депозит", na=False)]
@@ -209,7 +198,6 @@ def load_sheet_data() -> tuple[float, dict, dict]:
                     deposit = v
                     break
 
-    # Строка заголовков
     hdr = None
     for i in range(min(30, len(raw))):
         if _norm(raw.iloc[i, 0]) in {"тикер", "ticker", "secid"}:
@@ -547,19 +535,20 @@ html,body,[class*="css"]{
 .block-container{padding-top:.7rem;padding-bottom:1.1rem;max-width:760px;}
 #MainMenu,footer{visibility:hidden;}
 
+/* ── ЗАГОЛОВОК: на десктопе в одну строку, на мобильном — в две ── */
 .app-title{
   display:flex;align-items:center;justify-content:space-between;gap:10px;
   background:linear-gradient(104deg,var(--ink) 0%,var(--ink2) 46%,#22357A 100%);
   color:#fff;border-radius:10px;padding:8px 12px;margin-bottom:9px;
   box-shadow:0 6px 18px -10px rgba(11,18,32,.75);
-  flex-wrap:wrap;
 }
-.app-title h1{font-size:.95rem;font-weight:700;margin:0;letter-spacing:.2px;flex:1;min-width:0;}
+.app-title-main{flex:1;min-width:0;}
+.app-title h1{font-size:.95rem;font-weight:700;margin:0;letter-spacing:.2px;}
 .app-title .sub{font-size:.63rem;color:#9FB2D8;font-family:var(--mono);letter-spacing:.4px;}
 .app-title .pulse{
   font-size:.63rem;font-family:var(--mono);background:rgba(255,255,255,.10);
   border:1px solid rgba(255,255,255,.20);border-radius:999px;padding:2px 8px;color:#DCE6FF;
-  white-space:nowrap;
+  white-space:nowrap;flex-shrink:0;
 }
 .app-title .pulse b{color:#FFD27A;}
 
@@ -734,15 +723,22 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 .stButton>button:hover{border-color:var(--info);transform:translateY(-1px);}
 .streamlit-expanderHeader{font-size:.74rem;font-weight:600;}
 
+/* ── МОБИЛЬНАЯ АДАПТАЦИЯ ── */
 @media (max-width:640px){
   .block-container{padding-top:.45rem!important;padding-bottom:.6rem!important;}
   .stApp>header{display:none;}
   
-  /* Адаптация заголовка для мобильных */
-  .app-title{padding:6px 10px;gap:6px;margin-bottom:7px;}
+  /* Заголовок: счётчик уровней уходит на вторую строку */
+  .app-title{
+    flex-direction:column;align-items:stretch;gap:4px;
+    padding:6px 10px;margin-bottom:7px;
+  }
+  .app-title-main{width:100%;}
   .app-title h1{font-size:.78rem;line-height:1.2;}
   .app-title .sub{font-size:.55rem;}
-  .app-title .pulse{font-size:.55rem;padding:2px 6px;}
+  .app-title .pulse{
+    align-self:flex-start;font-size:.58rem;padding:2px 7px;
+  }
   
   div[data-testid="stNumberInput"] label{display:none!important;}
   div[data-testid="stNumberInput"] input{height:2.15rem!important;font-size:14px!important;}
@@ -764,7 +760,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .lad-tick{font-size:.52rem;}
   .app-title h1{font-size:.72rem;}
   .app-title .sub{font-size:.5rem;}
-  .app-title .pulse{font-size:.5rem;padding:1px 5px;}
+  .app-title .pulse{font-size:.52rem;padding:1px 6px;}
 }
 </style>
 """,
@@ -780,7 +776,7 @@ level_cells = sum(1 for ss in sheet_map.values() for s in ss if s.get("level") i
 st.markdown(
     f"""
 <div class="app-title">
-  <div>
+  <div class="app-title-main">
     <h1>Калькулятор фьючерсов QCKSLVR TRADING</h1>
     <div class="sub">FORTS · RISK DESK · ZONES A/B</div>
   </div>
