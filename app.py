@@ -56,6 +56,13 @@ ZONE_LABEL = {
     3: ("Зона 3", "высокий риск"),
 }
 
+# ── Типы результативного движения ──
+MOVE_CLASSES = {
+    "Зигзаг":    "move-zigzag",
+    "Тенденция": "move-trend",
+    "Волна":     "move-wave",
+}
+
 
 # ─────────────────────────────────────────────────────────────
 # ЧИСЛА И ФОРМАТЫ
@@ -81,6 +88,22 @@ def parse_number(val) -> float | None:
     except ValueError:
         return None
     return v if math.isfinite(v) else None
+
+
+def normalize_move(val) -> str | None:
+    """Нормализует значение столбца «Результативное движение»."""
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if not s or s in {"nan", "none", "—", "-", "нет", "—" }:
+        return None
+    if "зигзаг" in s or "zigzag" in s:
+        return "Зигзаг"
+    if "тенденц" in s or "trend" in s:
+        return "Тенденция"
+    if "волн" in s or "wave" in s:
+        return "Волна"
+    return None
 
 
 def fmt_px(v, decimals: int = 2) -> str:
@@ -119,6 +142,14 @@ def fmt_clock(ts: float | None) -> str:
     if not ts:
         return "—"
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def move_tag_html(move: str | None) -> str:
+    """Компактный HTML-бейдж типа движения."""
+    if not move or move not in MOVE_CLASSES:
+        return ""
+    cls = MOVE_CLASSES[move]
+    return f'<span class="move-tag {cls}">{move}</span>'
 
 
 # ─────────────────────────────────────────────────────────────
@@ -172,7 +203,8 @@ def _norm(s) -> str:
 def load_sheet_data() -> tuple[float, dict, dict]:
     deposit = 100_000.0
     tmap: dict[str, list[dict]] = {}
-    meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(), "level_col": False}
+    meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(),
+            "level_col": False, "move_col": False}
 
     try:
         raw = pd.read_csv(SHEET_URL, header=None, dtype=str, keep_default_na=False)
@@ -221,7 +253,10 @@ def load_sheet_data() -> tuple[float, dict, dict]:
     c_a = find(lambda n: n in {"a", "точка a", "а"}, 2)
     c_b = find(lambda n: n in {"b", "точка b", "в"}, 3)
     c_l = find(lambda n: "уровень" in n or "level" in n or n in {"ур", "ур.", "lvl"}, None)
+    c_m = find(lambda n: ("движен" in n or "movement" in n or "move" in n
+                          or n in {"тип", "type", "движ", "движ."}), None)
     meta["level_col"] = c_l is not None
+    meta["move_col"] = c_m is not None
 
     def cell(row, idx):
         if idx is None or idx >= len(row):
@@ -237,10 +272,11 @@ def load_sheet_data() -> tuple[float, dict, dict]:
         a = parse_number(cell(row, c_a))
         b = parse_number(cell(row, c_b))
         lvl = parse_number(cell(row, c_l))
+        move = normalize_move(cell(row, c_m))
         d = None
         if a is not None and b is not None and a != b:
             d = "LONG" if a < b else "SHORT"
-        setup = {"tw": tw, "a": a, "b": b, "level": lvl, "dir": d}
+        setup = {"tw": tw, "a": a, "b": b, "level": lvl, "dir": d, "move": move}
         bucket = tmap.setdefault(t, [])
         if setup not in bucket:
             bucket.append(setup)
@@ -429,6 +465,7 @@ def build_summary(instruments: dict, tmap: dict) -> list[dict]:
                 "state": level_state(inst.price, s),
                 "a": s["a"],
                 "b": s["b"],
+                "move": s.get("move"),
             })
     return out
 
@@ -535,7 +572,6 @@ html,body,[class*="css"]{
 .block-container{padding-top:.7rem;padding-bottom:1.1rem;max-width:760px;}
 #MainMenu,footer{visibility:hidden;}
 
-/* ── ЗАГОЛОВОК: на десктопе в одну строку, на мобильном — в две ── */
 .app-title{
   display:flex;align-items:center;justify-content:space-between;gap:10px;
   background:linear-gradient(104deg,var(--ink) 0%,var(--ink2) 46%,#22357A 100%);
@@ -689,6 +725,16 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 .ref-row b.L{color:var(--long-deep);} .ref-row b.S{color:var(--short-deep);}
 .ref-row .lv{color:#8A5308;}
 
+/* ── МЕТКИ ТИПА ДВИЖЕНИЯ ── */
+.move-tag{
+  display:inline-block;font-family:var(--mono);font-size:.58rem;font-weight:700;
+  letter-spacing:.3px;padding:1px 5px;border-radius:3px;margin-left:3px;
+  vertical-align:middle;white-space:nowrap;
+}
+.move-zigzag{background:#E9EEF6;color:#5A6577;border:1px solid #B7C3D8;}
+.move-trend{background:#E3E9FE;color:#1E3A8A;border:1px solid #B9C6F7;}
+.move-wave{background:#FDF1D8;color:#8A5308;border:1px solid #EBC98A;}
+
 .sum-head{display:flex;gap:5px;align-items:center;margin:2px 0 4px;flex-wrap:wrap;}
 .badge{font-family:var(--mono);font-size:.62rem;font-weight:700;border-radius:999px;padding:2px 8px;
   background:var(--surface2);color:var(--ink2);border:1px solid var(--line);}
@@ -727,8 +773,6 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 @media (max-width:640px){
   .block-container{padding-top:.45rem!important;padding-bottom:.6rem!important;}
   .stApp>header{display:none;}
-  
-  /* Заголовок: счётчик уровней уходит на вторую строку */
   .app-title{
     flex-direction:column;align-items:stretch;gap:4px;
     padding:6px 10px;margin-bottom:7px;
@@ -736,10 +780,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .app-title-main{width:100%;}
   .app-title h1{font-size:.78rem;line-height:1.2;}
   .app-title .sub{font-size:.55rem;}
-  .app-title .pulse{
-    align-self:flex-start;font-size:.58rem;padding:2px 7px;
-  }
-  
+  .app-title .pulse{align-self:flex-start;font-size:.58rem;padding:2px 7px;}
   div[data-testid="stNumberInput"] label{display:none!important;}
   div[data-testid="stNumberInput"] input{height:2.15rem!important;font-size:14px!important;}
   div[data-testid="stNumberInput"]{min-height:2.15rem!important;}
@@ -754,6 +795,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .lad-tick{font-size:.56rem;}
   .strip .v{font-size:.78rem;}
   .chip.mini{font-size:.58rem;padding:1px 6px;}
+  .move-tag{font-size:.52rem;padding:1px 4px;}
 }
 @media (max-width:360px){
   .desk{grid-template-columns:118px 1fr;}
@@ -965,13 +1007,17 @@ with st.sidebar:
                 mark = f'<span class="bell">{BELL} {fmt_px(x["level"], x["decimals"])}</span>'
             elif x["state"] == "expired":
                 mark = '<span class="off">снят</span>'
+            # Метка типа результативного движения
+            move_html = move_tag_html(x.get("move"))
             hint = (f'{x["ticker"]} · {x["dir"]} · цена {fmt_px(x["price"], x["decimals"])} · '
-                    f'A {fmt_px(x["a"], x["decimals"])} / B {fmt_px(x["b"], x["decimals"])}')
+                    f'A {fmt_px(x["a"], x["decimals"])} / B {fmt_px(x["b"], x["decimals"])}'
+                    + (f' · {x["move"]}' if x.get("move") else ""))
             rows.append(
                 f'<div class="sum-row{" hot" if x["state"] == "reached" else ""}" title="{hint}">'
                 f'<span class="em">{DIR_EMOJI.get(x["dir"], "")}</span>'
                 f'<span class="tk">{x["ticker"]}</span>'
                 f'{tw}'
+                f'{move_html}'
                 f'<span class="zn">{zn}</span>'
                 f'{mark}'
                 f'</div>'
@@ -1020,9 +1066,10 @@ with st.sidebar:
             b_t = fmt_px(s["b"], dec) if s["b"] is not None else "—"
             lv = (f' · <span class="lv">ур {fmt_px(s["level"], dec)}</span>'
                   if s.get("level") is not None else "")
+            mv = move_tag_html(s.get("move"))
             ref.append(
                 f'<div class="ref-row"><b class="{cls}">{s["dir"] or "—"}</b> '
-                f'A {a_t} · B {b_t}{lv}</div>'
+                f'A {a_t} · B {b_t}{lv}{mv}</div>'
             )
         st.markdown(f'<div class="ref">{"".join(ref)}</div>', unsafe_allow_html=True)
     else:
@@ -1043,10 +1090,13 @@ with st.sidebar:
     ims_note = "IMS подключён" if not ims.empty else "IMS недоступен — базовое ГО"
     sheet_note = "таблица OK" if sheet_meta["ok"] else "таблица недоступна"
     lvl_note = "колонка «уровень» найдена" if sheet_meta["level_col"] else "колонки «уровень» нет"
+    move_note = ("колонка «движение» найдена" if sheet_meta["move_col"]
+                 else "колонки «движение» нет")
     scope_note = "список: таблица" if filter_active else "список: все фьючерсы"
     st.markdown(
         f'<div class="meta-note">котировки {fmt_clock(fut_ts)} · таблица {fmt_clock(sheet_meta["ts"])}<br>'
-        f'{len(instruments)} контрактов · {scope_note}<br>{ims_note}<br>{sheet_note} · {lvl_note}</div>',
+        f'{len(instruments)} контрактов · {scope_note}<br>{ims_note}<br>'
+        f'{sheet_note} · {lvl_note} · {move_note}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1146,10 +1196,11 @@ st.markdown(
 for s in setups:
     if level_state(inst.price, s) == "reached":
         cmp = "≤" if s["dir"] == "LONG" else "≥"
+        move_html = move_tag_html(s.get("move"))
         st.markdown(
             f'<div class="hit-banner"><span class="b">{BELL}</span>'
             f'<span>{s["dir"]}: цена {fmt_px(inst.price, dec)} {cmp} уровень '
-            f'{fmt_px(s["level"], dec)} — сигнал на вход</span></div>',
+            f'{fmt_px(s["level"], dec)}{move_html} — сигнал на вход</span></div>',
             unsafe_allow_html=True,
         )
 
@@ -1363,8 +1414,9 @@ else:
             if stt == "none":
                 continue
             tag = {"reached": "ОТРАБОТАН", "armed": "ожидание", "expired": "снят (цена за A)"}[stt]
+            move_text = f" · движение: {s['move']}" if s.get("move") else ""
             level_block += (
-                f"- {s['dir']}: уровень `{fmt_px(s['level'], dec)}` — **{tag}** "
+                f"- {s['dir']}: уровень `{fmt_px(s['level'], dec)}` — **{tag}**{move_text} "
                 f"(цена `{fmt_px(inst.price, dec)}`)\n"
             )
         if level_block:
