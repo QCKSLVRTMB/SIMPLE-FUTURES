@@ -731,9 +731,12 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   letter-spacing:.3px;padding:1px 5px;border-radius:3px;margin-left:3px;
   vertical-align:middle;white-space:nowrap;
 }
-.move-zigzag{background:#E9EEF6;color:#5A6577;border:1px solid #B7C3D8;}
-.move-trend{background:#E3E9FE;color:#1E3A8A;border:1px solid #B9C6F7;}
-.move-wave{background:#FDF1D8;color:#8A5308;border:1px solid #EBC98A;}
+/* Зигзаг — красный (боковое/неопределённое движение) */
+.move-zigzag{background:var(--short-soft);color:var(--short-deep);border:1px solid #EFB3B3;}
+/* Тенденция — зелёный (устойчивое направленное движение) */
+.move-trend{background:var(--long-soft);color:var(--long-deep);border:1px solid #A9DFCB;}
+/* Волна — синий (сложное волновое движение) */
+.move-wave{background:var(--info-soft);color:#1E3A8A;border:1px solid #B9C6F7;}
 
 .sum-head{display:flex;gap:5px;align-items:center;margin:2px 0 4px;flex-wrap:wrap;}
 .badge{font-family:var(--mono);font-size:.62rem;font-weight:700;border-radius:999px;padding:2px 8px;
@@ -1007,7 +1010,6 @@ with st.sidebar:
                 mark = f'<span class="bell">{BELL} {fmt_px(x["level"], x["decimals"])}</span>'
             elif x["state"] == "expired":
                 mark = '<span class="off">снят</span>'
-            # Метка типа результативного движения
             move_html = move_tag_html(x.get("move"))
             hint = (f'{x["ticker"]} · {x["dir"]} · цена {fmt_px(x["price"], x["decimals"])} · '
                     f'A {fmt_px(x["a"], x["decimals"])} / B {fmt_px(x["b"], x["decimals"])}'
