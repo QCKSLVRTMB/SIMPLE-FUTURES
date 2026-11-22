@@ -565,11 +565,13 @@ st.markdown(
 html,body,[class*="css"]{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
 }
+/* Компенсация обрезания верхнего контента на мобильных браузерах */
+html, body { scroll-padding-top: 1.5rem; }
 .stApp{background:
   radial-gradient(1100px 420px at 12% -8%, #E6EDFB 0%, rgba(230,237,251,0) 62%),
   radial-gradient(760px 380px at 104% 4%, #E4F5EE 0%, rgba(228,245,238,0) 58%),
   var(--paper);}
-.block-container{padding-top:.7rem;padding-bottom:1.1rem;max-width:760px;}
+.block-container{padding-top:1.4rem;padding-bottom:1.1rem;max-width:760px;}
 #MainMenu,footer{visibility:hidden;}
 
 .app-title{
@@ -949,9 +951,9 @@ with st.sidebar:
         step=1000.0, format="%.2f", key="deposit_input",
     )
     st.markdown(
-    f'<div class="ref"><div class="ref-row">Таблица&nbsp;B1: <b>{fmt_n(sheet_deposit, 2)}</b> руб.</div></div>',
-    unsafe_allow_html=True,
-)
+        f'<div class="ref"><div class="ref-row">Таблица&nbsp;B1: <b>{fmt_n(sheet_deposit, 2)}</b> руб.</div></div>',
+        unsafe_allow_html=True,
+    )
     risk_pct = st.number_input(
         "Риск на сделку, %", min_value=0.1, max_value=100.0,
         value=1.0, step=0.1, key="risk_pct_input",
