@@ -1,14 +1,13 @@
-"""
-Калькулятор фьючерсов MOEX — Strict Mobile Version (Fixed Execution Order).
-Автоматически подгружает справочные данные из Google Sheets.
-Зависимости: streamlit, pandas, requests.
-"""
+# app.py — Калькулятор фьючерсов MOEX · монитор уровней и зон A/B · с учётом комиссий
 from __future__ import annotations
 
 import math
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from io import StringIO
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -19,23 +18,28 @@ from requests.adapters import HTTPAdapter, Retry
 # КОНСТАНТЫ
 # ─────────────────────────────────────────────────────────────
 ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0/export?format=csv"
+SHEET_ID = "1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+# Отдельный URL для листа "Комиссии" (gviz/tq позволяет указать имя листа)
+COMMISSIONS_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
+    f"?tqx=out:csv&sheet={quote('Комиссии')}"
+)
 
 MARGIN_LEVELS = ["НАЧ. ГО", "КНУР", "КСУР", "КПУР", "КОУР"]
 MARGIN_HINTS = {
-    "НАЧ. ГО": "НАЧ. ГО — базовое гарантийное обеспечение",
-    "КНУР":    "КНУР — начальный уровень риска (LRC)",
-    "КСУР":    "КСУР — стандартный уровень риска (MRC)",
-    "КПУР":    "КПУР — повышенный уровень риска (HRC)",
-    "КОУР":    "КОУР — особый уровень риска (ERC)",
+    "НАЧ. ГО": "НАЧ. ГО — базовое",
+    "КНУР": "КНУР — начальный (LRC)",
+    "КСУР": "КСУР — стандартный (MRC)",
+    "КПУР": "КПУР — повышенный (HRC)",
+    "КОУР": "КОУР — особый (ERC)",
 }
-
 IMS_MARGIN_MAP = {
-    "НАЧ. ГО": ("IM_BUY",      "IM_SELL"),
-    "КНУР":    ("IM_BUY_LRC",  "IM_SELL_LRC"),
-    "КСУР":    ("IM_BUY_MRC",  "IM_SELL_MRC"),
-    "КПУР":    ("IM_BUY_HRC",  "IM_SELL_HRC"),
-    "КОУР":    ("IM_BUY_ERC",  "IM_SELL_ERC"),
+    "НАЧ. ГО": ("IM_BUY", "IM_SELL"),
+    "КНУР": ("IM_BUY_LRC", "IM_SELL_LRC"),
+    "КСУР": ("IM_BUY_MRC", "IM_SELL_MRC"),
+    "КПУР": ("IM_BUY_HRC", "IM_SELL_HRC"),
+    "КОУР": ("IM_BUY_ERC", "IM_SELL_ERC"),
 }
 
 TRADE_STATE_KEYS = [
@@ -46,27 +50,87 @@ TRADE_STATE_KEYS = [
     "point_a_input", "point_b_input",
 ]
 
+DIR_EMOJI = {"LONG": "🟩", "SHORT": "🟥"}
+ZONE_EMOJI = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣"}
+BELL = "🔔"
+
+ZONE_LABEL = {
+    1: ("Зона 1", "оптимальная"),
+    2: ("Зона 2", "повышенный риск"),
+    3: ("Зона 3", "высокий риск"),
+}
+
+MOVE_CLASSES = {
+    "Зигзаг":    "move-zigzag",
+    "Тенденция": "move-trend",
+    "Волна":     "move-wave",
+}
+
+MOVE_RANK = {"Зигзаг": 0, "Тенденция": 1, "Волна": 2}
+
+# Дефолтная комиссия (если тариф не найден в таблице)
+DEFAULT_COMMISSION_PCT = 0.05
+DEFAULT_MIN_COMMISSION = 2.0
+
 
 # ─────────────────────────────────────────────────────────────
-# ПАРСИНГ И ФОРМАТИРОВАНИЕ
+# ЧИСЛА И ФОРМАТЫ
 # ─────────────────────────────────────────────────────────────
 def parse_number(val) -> float | None:
-    if val is None or (isinstance(val, float) and math.isnan(val)):
+    if val is None:
         return None
     s = str(val).strip()
-    if not s or s.lower() == "nan":
+    if not s or s.lower() in {"nan", "none", "—", "-"}:
         return None
-    s = s.replace("р.", "").replace("руб.", "").replace("₽", "").replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    s = re.sub(r"[^\d,.\-+]", "", s)
+    if not s or s in {"-", "+", ".", ","}:
+        return None
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
     try:
-        return float(s)
+        v = float(s)
     except ValueError:
         return None
+    return v if math.isfinite(v) else None
+
+
+def normalize_move(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if not s or s in {"nan", "none", "—", "-", "нет"}:
+        return None
+    if "зигзаг" in s or "zigzag" in s:
+        return "Зигзаг"
+    if "тенденц" in s or "trend" in s:
+        return "Тенденция"
+    if "волн" in s or "wave" in s:
+        return "Волна"
+    return None
+
+
+def fmt_px(v, decimals: int = 2) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
+        return "—"
+    d = max(0, min(int(decimals), 8))
+    return f"{v:.{d}f}".replace(".", ",")
 
 
 def fmt_n(v, decimals: int = 0) -> str:
     try:
         v = float(v)
     except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v):
         return "—"
     d = max(0, min(int(decimals), 6))
     s = f"{v:.{d}f}"
@@ -77,100 +141,284 @@ def fmt_n(v, decimals: int = 0) -> str:
 
 def fmt_date(s) -> str:
     try:
-        s = str(s).strip()
-        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
     except Exception:
         return str(s) if s else "—"
 
 
-def determine_zone(price: float | None, a: float | None, b: float | None) -> tuple[int | None, tuple | None]:
+def fmt_clock(ts: float | None) -> str:
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def move_tag_html(move: str | None) -> str:
+    if not move or move not in MOVE_CLASSES:
+        return ""
+    cls = MOVE_CLASSES[move]
+    return f'<span class="move-tag {cls}">{move}</span>'
+
+
+# ─────────────────────────────────────────────────────────────
+# ЗОНЫ A/B И УРОВНИ
+# ─────────────────────────────────────────────────────────────
+def zone_bands(a: float, b: float) -> tuple[float, float]:
+    p1 = a + (b - a) / 3.0
+    p2 = a + 2.0 * (b - a) / 3.0
+    return p1, p2
+
+
+def determine_zone(price, a, b) -> tuple[int | None, dict | None]:
     if price is None or a is None or b is None or a == b:
         return None, None
-    
-    step = (b - a) / 3
-    
-    z1_low, z1_high = min(a, a + step), max(a, a + step)
-    z2_low, z2_high = min(a + step, a + 2 * step), max(a + step, a + 2 * step)
-    z3_low, z3_high = min(a + 2 * step, b), max(a + 2 * step, b)
-    
-    boundaries = (z1_low, z1_high, z2_low, z2_high, z3_low, z3_high)
-    
-    if z1_low <= price <= z1_high:
-        return 1, boundaries
-    elif z2_low <= price <= z2_high:
-        return 2, boundaries
-    elif z3_low <= price <= z3_high:
-        return 3, boundaries
-    return None, boundaries
+    p1, p2 = zone_bands(a, b)
+    lo, hi = min(a, b), max(a, b)
+    info = {"a": a, "b": b, "p1": p1, "p2": p2, "lo": lo, "hi": hi,
+            "dir": "LONG" if a < b else "SHORT"}
+    if price < lo or price > hi:
+        info["outside"] = "below" if price < lo else "above"
+        return None, info
+    info["outside"] = None
+    if a < b:
+        z = 1 if price <= p1 else (2 if price <= p2 else 3)
+    else:
+        z = 1 if price >= p1 else (2 if price >= p2 else 3)
+    return z, info
+
+
+def level_state(price, setup: dict) -> str:
+    lvl, a, d = setup.get("level"), setup.get("a"), setup.get("dir")
+    if price is None or lvl is None or a is None or d is None:
+        return "none"
+    if d == "LONG":
+        if price < a:
+            return "expired"
+        return "reached" if price <= lvl else "armed"
+    if price > a:
+        return "expired"
+    return "reached" if price >= lvl else "armed"
 
 
 # ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ ИЗ GOOGLE SHEETS
+# GOOGLE SHEETS: ОСНОВНОЙ ЛИСТ
+# ─────────────────────────────────────────────────────────────
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_sheet_data() -> tuple[float, dict, dict, str]:
+    """Возвращает: (депозит, маппинг тикеров, мета, название тарифа из E1)."""
+    deposit = 100_000.0
+    tmap: dict[str, list[dict]] = {}
+    meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(),
+            "level_col": False, "move_col": False,
+            "entry_col": False, "sl_col": False, "tp_col": False}
+    tariff_name = ""
+
+    try:
+        raw = pd.read_csv(SHEET_URL, header=None, dtype=str, keep_default_na=False)
+    except Exception as e:
+        meta["error"] = f"{type(e).__name__}: {e}"
+        return deposit, tmap, meta, tariff_name
+
+    if raw.empty:
+        meta["error"] = "таблица пуста"
+        return deposit, tmap, meta, tariff_name
+
+    # Депозит — B1
+    if raw.shape[1] > 1:
+        v = parse_number(raw.iloc[0, 1])
+        if v is not None and v > 0:
+            deposit = v
+
+    # Резерв: слово «Депозит»
+    if deposit == 100_000.0:
+        for c in range(min(4, raw.shape[1])):
+            hit = raw[raw[c].map(_norm).str.contains("депозит", na=False)]
+            if not hit.empty and c + 1 < raw.shape[1]:
+                v = parse_number(raw.iloc[hit.index[0], c + 1])
+                if v is not None and v > 0:
+                    deposit = v
+                    break
+
+    # Тариф из E1 (строка 0, столбец 4)
+    if raw.shape[1] > 4:
+        tariff_name = str(raw.iloc[0, 4]).strip()
+        if tariff_name.lower() in {"nan", "none", ""}:
+            tariff_name = ""
+
+    hdr = None
+    for i in range(min(30, len(raw))):
+        if _norm(raw.iloc[i, 0]) in {"тикер", "ticker", "secid"}:
+            hdr = i
+            break
+    if hdr is None:
+        meta["error"] = "не найдена строка заголовков «Тикер»"
+        meta["ok"] = True
+        return deposit, tmap, meta, tariff_name
+
+    names = [_norm(x) for x in raw.iloc[hdr].tolist()]
+
+    def find(pred, default):
+        for i, n in enumerate(names):
+            if pred(n):
+                return i
+        return default
+
+    c_t = find(lambda n: n in {"тикер", "ticker", "secid"}, 0)
+    c_tw = find(lambda n: "tw" in n or "tradingview" in n, 1)
+    c_a = find(lambda n: n in {"a", "точка a", "а"}, 2)
+    c_b = find(lambda n: n in {"b", "точка b", "в"}, 3)
+    c_l = find(lambda n: "уровень" in n or "level" in n or n in {"ур", "ур.", "lvl"}, None)
+    c_m = find(lambda n: ("движен" in n or "movement" in n or "move" in n
+                          or n in {"тип", "type", "движ", "движ."}), None)
+    c_entry = find(lambda n: ("твх" in n or "вход" in n or "entry" in n
+                              or n in {"цена входа", "цена", "price"}), None)
+    c_sl = find(lambda n: ("sl" in n or "стоп" in n or "stop" in n
+                           or n in {"стоп-лосс", "stop-loss", "стоп лосс"}), None)
+    c_tp = find(lambda n: ("tp" in n or "тейк" in n or "take" in n
+                           or n in {"тейк-профит", "take-profit", "тейк профит"}), None)
+    meta["level_col"] = c_l is not None
+    meta["move_col"] = c_m is not None
+    meta["entry_col"] = c_entry is not None
+    meta["sl_col"] = c_sl is not None
+    meta["tp_col"] = c_tp is not None
+
+    def cell(row, idx):
+        if idx is None or idx >= len(row):
+            return None
+        return row.iloc[idx]
+
+    for i in range(hdr + 1, len(raw)):
+        row = raw.iloc[i]
+        t = str(cell(row, c_t) or "").strip().upper()
+        if not t or _norm(t) in {"тикер", "ticker", "nan", "итого"}:
+            continue
+        tw = str(cell(row, c_tw) or "").strip()
+        a = parse_number(cell(row, c_a))
+        b = parse_number(cell(row, c_b))
+        lvl = parse_number(cell(row, c_l))
+        move = normalize_move(cell(row, c_m))
+        entry = parse_number(cell(row, c_entry))
+        sl = parse_number(cell(row, c_sl))
+        tp = parse_number(cell(row, c_tp))
+        d = None
+        if a is not None and b is not None and a != b:
+            d = "LONG" if a < b else "SHORT"
+        setup = {
+            "tw": tw, "a": a, "b": b, "level": lvl, "dir": d, "move": move,
+            "entry": entry, "sl": sl, "tp": tp,
+        }
+        bucket = tmap.setdefault(t, [])
+        if setup not in bucket:
+            bucket.append(setup)
+        meta["rows"] += 1
+
+    meta["ok"] = True
+    return deposit, tmap, meta, tariff_name
+
+
+# ─────────────────────────────────────────────────────────────
+# GOOGLE SHEETS: ЛИСТ "КОМИССИИ"
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_sheet_data() -> tuple[float, dict]:
-    default_deposit = 100000.0
-    ticker_map = {}
-    
+def load_commissions() -> tuple[dict, dict]:
+    """
+    Возвращает:
+      - tariff_book: dict[name] = {"broker": str, "pct": float, "min": float}
+      - meta: {"ok": bool, "error": str|None, "ts": float}
+    """
+    book: dict[str, dict] = {}
+    meta = {"ok": False, "error": None, "ts": time.time()}
+
     try:
-        df = pd.read_csv(SHEET_URL, header=None)
-        
-        if len(df) > 0 and len(df.columns) > 1:
-            val = parse_number(df.iloc[0, 1])
-            if val is not None and val > 0:
-                default_deposit = val
-        
-        if default_deposit == 100000.0:
-            for col_idx in range(min(4, len(df.columns))):
-                deposit_rows = df[df[col_idx].astype(str).str.contains("Депозит", na=False, case=False)]
-                if not deposit_rows.empty:
-                    row_idx = deposit_rows.index[0]
-                    if col_idx + 1 < len(df.columns):
-                        val = parse_number(df.iloc[row_idx, col_idx + 1])
-                        if val is not None and val > 0:
-                            default_deposit = val
-                            break
-        
-        header_idx = df[df[0].astype(str).str.contains("Тикер", na=False, case=False)].index
-        if not header_idx.empty:
-            idx = header_idx[0]
-            data_df = df.iloc[idx+1:].dropna(how='all')
-            data_df.columns = ["Тикер", "Тикер TW", "A", "B"]
-            
-            for _, row in data_df.iterrows():
-                t = str(row["Тикер"]).strip()
-                if t and t.lower() != "nan":
-                    tw_val = str(row["Тикер TW"]).strip() if pd.notna(row["Тикер TW"]) else ""
-                    pt_a = parse_number(row["A"])
-                    pt_b = parse_number(row["B"])
-
-                    direction = None
-                    if pt_a is not None and pt_b is not None:
-                        direction = "LONG" if pt_a < pt_b else "SHORT"
-
-                    setup = {"tw": tw_val, "a": pt_a, "b": pt_b, "dir": direction}
-                    
-                    if t not in ticker_map:
-                        ticker_map[t] = []
-                    ticker_map[t].append(setup)
-                    
+        raw = pd.read_csv(COMMISSIONS_URL, header=0, dtype=str, keep_default_na=False)
     except Exception as e:
-        st.warning(f"Не удалось загрузить данные из Google Sheets: {e}")
-        
-    return default_deposit, ticker_map
+        meta["error"] = f"{type(e).__name__}: {e}"
+        return book, meta
+
+    if raw.empty or raw.shape[1] < 3:
+        meta["error"] = "лист «Комиссии» пуст или имеет меньше 3 колонок"
+        return book, meta
+
+    # Нормализуем названия колонок
+    cols = [str(c).strip().lower() for c in raw.columns]
+
+    def find_col(*variants):
+        for v in variants:
+            for i, c in enumerate(cols):
+                if v in c:
+                    return i
+        return None
+
+    c_name = find_col("название", "тариф", "name") or 0
+    c_broker = find_col("брокер", "broker") or 1
+    c_pct = find_col("комиссия", "%", "pct", "rate")
+    c_min = find_col("мин", "min")
+
+    if c_pct is None:
+        c_pct = 2 if raw.shape[1] > 2 else None
+    if c_min is None and raw.shape[1] > 3:
+        c_min = 3
+
+    for _, row in raw.iterrows():
+        name = str(row.iloc[c_name]).strip()
+        if not name or name.lower() in {"nan", "none", ""}:
+            continue
+        broker = str(row.iloc[c_broker]).strip() if c_broker is not None else ""
+        pct = parse_number(row.iloc[c_pct]) if c_pct is not None else None
+        mn = parse_number(row.iloc[c_min]) if c_min is not None else None
+        if pct is None:
+            continue
+        book[name] = {
+            "broker": broker,
+            "pct": pct,
+            "min": mn if mn is not None else 0.0,
+        }
+
+    meta["ok"] = True
+    return book, meta
+
+
+def resolve_commission(tariff_name: str, book: dict) -> tuple[float, float, str, bool]:
+    """
+    Возвращает (pct, min_commission, resolved_name, found).
+    Если тариф не найден — возвращает дефолтные значения.
+    """
+    if not tariff_name:
+        return DEFAULT_COMMISSION_PCT, DEFAULT_MIN_COMMISSION, "", False
+    # Точное совпадение
+    if tariff_name in book:
+        rec = book[tariff_name]
+        return rec["pct"], rec["min"], tariff_name, True
+    # Нечувствительное к регистру
+    key = tariff_name.lower()
+    for name, rec in book.items():
+        if name.lower() == key:
+            return rec["pct"], rec["min"], name, True
+    return DEFAULT_COMMISSION_PCT, DEFAULT_MIN_COMMISSION, tariff_name, False
+
+
+def calc_commission(turnover: float, pct: float, min_comm: float) -> float:
+    """Комиссия за одну сторону сделки."""
+    if turnover <= 0:
+        return 0.0
+    return max(turnover * pct / 100.0, min_comm)
 
 
 # ─────────────────────────────────────────────────────────────
-# HTTP-СЕССИЯ И MOEX ISS
+# MOEX ISS
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-calc/7.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/15.0"})
     s.mount(
         "https://",
         HTTPAdapter(
-            max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504)),
+            max_retries=Retry(total=3, backoff_factor=0.5,
+                              status_forcelist=(429, 500, 502, 503, 504)),
             pool_maxsize=8,
         ),
     )
@@ -178,49 +426,61 @@ def _session() -> requests.Session:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_futures() -> pd.DataFrame:
+def fetch_futures() -> tuple[pd.DataFrame, float, str | None]:
+    ts = time.time()
     try:
-        r = _session().get(f"{ISS}/securities.json", params={"iss.meta": "off", "iss.only": "securities,marketdata"}, timeout=30)
+        r = _session().get(
+            f"{ISS}/securities.json",
+            params={"iss.meta": "off", "iss.only": "securities,marketdata"},
+            timeout=30,
+        )
         r.raise_for_status()
         js = r.json()
         sec = pd.DataFrame(js["securities"]["data"], columns=js["securities"]["columns"])
         mkt = pd.DataFrame(js["marketdata"]["data"], columns=js["marketdata"]["columns"])
     except Exception as e:
-        st.error(f"MOEX ISS недоступен: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), ts, f"{type(e).__name__}: {e}"
 
     sec = sec.drop_duplicates("SECID", keep="first")
     mkt = mkt.drop_duplicates("SECID", keep="first")
-    df = sec.merge(mkt, on="SECID", how="left")
+    df = sec.merge(mkt, on="SECID", how="left", suffixes=("", "_m"))
 
-    for col in ("MINSTEP", "STEPPRICE", "INITIALMARGIN", "LAST", "PREVSETTLEPRICE"):
+    for col in ("MINSTEP", "STEPPRICE", "INITIALMARGIN", "LAST",
+                "PREVSETTLEPRICE", "DECIMALS"):
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     df = df[(df["MINSTEP"] > 0) & (df["STEPPRICE"] > 0)].copy()
     df["PRICE"] = df["LAST"].where(df["LAST"] > 0, df["PREVSETTLEPRICE"])
-    return df
+    return df, ts, None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ims() -> pd.DataFrame:
+    def normalize(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df.columns = [str(c).upper().strip() for c in df.columns]
+        if "BOARDID" in df.columns:
+            f = df[df["BOARDID"] == "RFUD"]
+            if not f.empty:
+                df = f
+        if "SECID" in df.columns:
+            df = df.drop_duplicates("SECID", keep="first")
+        df = df.copy()
+        for c in df.columns:
+            if c.startswith("IM_") and c != "IM_TIME":
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        return df
+
     try:
         r = _session().get(f"{ISS}/ims.json", params={"iss.meta": "off"}, timeout=15)
         r.raise_for_status()
-        js = r.json()
-        block = js.get("ims") or {}
+        block = r.json().get("ims") or {}
         df = pd.DataFrame(block.get("data") or [], columns=block.get("columns") or [])
         if not df.empty:
-            df.columns = [str(c).upper().strip() for c in df.columns]
-            if "BOARDID" in df.columns:
-                df = df[df["BOARDID"] == "RFUD"].copy()
-            if "SECID" in df.columns:
-                df = df.drop_duplicates("SECID", keep="first").copy()
-            for c in df.columns:
-                if c.startswith("IM_") and c != "IM_TIME":
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            return df
+            return normalize(df)
     except Exception:
         pass
 
@@ -228,37 +488,25 @@ def fetch_ims() -> pd.DataFrame:
         r = _session().get(f"{ISS}/ims", params={"iss.meta": "off"}, timeout=15)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text), sep="|")
-        if not df.empty:
-            df.columns = [str(c).upper().strip() for c in df.columns]
-            if "BOARDID" in df.columns:
-                df = df[df["BOARDID"] == "RFUD"].copy()
-            if "SECID" in df.columns:
-                df = df.drop_duplicates("SECID", keep="first").copy()
-            for c in df.columns:
-                if c.startswith("IM_") and c != "IM_TIME":
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            return df
+        return normalize(df)
     except Exception:
-        st.warning("Не удалось загрузить точные ГО. Используются базовые значения.")
         return pd.DataFrame()
 
 
 def merge_margins(futures: pd.DataFrame, ims: pd.DataFrame, margin_type: str) -> pd.DataFrame:
     df = futures.copy()
-    base_margin = df["INITIALMARGIN"].fillna(0.0)
-    df["GO_LONG"] = base_margin
-    df["GO_SHORT"] = base_margin
-
+    base = df["INITIALMARGIN"].fillna(0.0)
+    df["GO_LONG"] = base
+    df["GO_SHORT"] = base
     cols = IMS_MARGIN_MAP.get(margin_type)
     if cols and not ims.empty and "SECID" in ims.columns:
-        col_b, col_s = cols
-        if col_b in ims.columns and col_s in ims.columns:
-            margin_map = ims.set_index("SECID")
-            df["GO_LONG"] = df["SECID"].map(margin_map[col_b]).fillna(base_margin)
-            df["GO_SHORT"] = df["SECID"].map(margin_map[col_s]).fillna(base_margin)
-
-    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, base_margin)
-    df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, base_margin)
+        cb, cs = cols
+        if cb in ims.columns and cs in ims.columns:
+            m = ims.set_index("SECID")
+            df["GO_LONG"] = df["SECID"].map(m[cb]).fillna(base)
+            df["GO_SHORT"] = df["SECID"].map(m[cs]).fillna(base)
+    df["GO_LONG"] = df["GO_LONG"].where(df["GO_LONG"] > 0, base)
+    df["GO_SHORT"] = df["GO_SHORT"].where(df["GO_SHORT"] > 0, base)
     return df
 
 
@@ -290,13 +538,16 @@ class Instrument:
         return round(round(p / self.min_step) * self.min_step, self.decimals)
 
 
-def _decimals(step: float) -> int:
+def _decimals_from_step(step: float) -> int:
     if step <= 0:
         return 2
-    return max(0, min(6, int(math.ceil(-math.log10(step)))))
+    return max(0, min(8, int(math.ceil(-math.log10(step) - 1e-9))))
 
 
 def _to_instrument(row: pd.Series) -> Instrument:
+    d = int(row.get("DECIMALS", 0) or 0)
+    if d <= 0:
+        d = _decimals_from_step(float(row["MINSTEP"]))
     return Instrument(
         ticker=str(row["SECID"]),
         name=str(row.get("SHORTNAME") or row["SECID"]),
@@ -306,444 +557,300 @@ def _to_instrument(row: pd.Series) -> Instrument:
         go_long=float(row["GO_LONG"]),
         go_short=float(row["GO_SHORT"]),
         expiry=str(row.get("LASTTRADEDATE") or "—"),
-        decimals=_decimals(float(row["MINSTEP"])),
+        decimals=max(0, min(8, d)),
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# СТРАНИЦА И CSS
+# СВОДКА
+# ─────────────────────────────────────────────────────────────
+def build_summary(instruments: dict, tmap: dict) -> list[dict]:
+    out = []
+    for t, setups in tmap.items():
+        inst = instruments.get(t)
+        if inst is None:
+            continue
+        for s in setups:
+            if s.get("dir") is None:
+                continue
+            z, info = determine_zone(inst.price, s["a"], s["b"])
+            out.append({
+                "ticker": t,
+                "tw": s.get("tw", ""),
+                "dir": s["dir"],
+                "zone": z,
+                "outside": (info or {}).get("outside"),
+                "price": inst.price,
+                "decimals": inst.decimals,
+                "level": s.get("level"),
+                "state": level_state(inst.price, s),
+                "a": s["a"],
+                "b": s["b"],
+                "move": s.get("move"),
+                "entry": s.get("entry"),
+                "sl": s.get("sl"),
+                "tp": s.get("tp"),
+            })
+    return out
+
+
+def sort_summary(items: list[dict], mode: str) -> list[dict]:
+    rank = {"reached": 0, "armed": 1, "none": 2, "expired": 3}
+
+    if mode == "По тикеру":
+        return sorted(items, key=lambda x: (x["ticker"], x["dir"]))
+
+    if mode == "По зоне":
+        return sorted(items, key=lambda x: (x["zone"] is None, x["zone"] or 9,
+                                            x["ticker"], x["dir"]))
+
+    if mode == "По уровню":
+        def _lvl_key(x):
+            if x["state"] == "reached":
+                return (0, 0.0, x["ticker"])
+            if x["state"] == "armed" and x.get("level") is not None:
+                return (1, abs(x["price"] - x["level"]), x["ticker"])
+            return (2, float("inf"), x["ticker"])
+        return sorted(items, key=_lvl_key)
+
+    if mode == "По движению":
+        def _move_key(x):
+            m = x.get("move")
+            m_rank = MOVE_RANK.get(m, 99) if m else 99
+            return (m_rank, x["ticker"], x["dir"])
+        return sorted(items, key=_move_key)
+
+    return sorted(items, key=lambda x: (rank.get(x["state"], 9),
+                                        x["zone"] is None, x["zone"] or 9,
+                                        x["ticker"], x["dir"]))
+
+
+# ─────────────────────────────────────────────────────────────
+# ВИЗУАЛИЗАЦИЯ: ЛЕСТНИЦА ЗОН
+# ─────────────────────────────────────────────────────────────
+def zone_ladder_html(info: dict, price: float, level: float | None,
+                     lvl_state: str, decimals: int) -> str:
+    lo, hi = info["lo"], info["hi"]
+    span = hi - lo
+    if span <= 0:
+        return ""
+
+    def y(v: float) -> float:
+        return max(0.0, min(100.0, (hi - v) / span * 100.0))
+
+    a, b, p1, p2 = info["a"], info["b"], info["p1"], info["p2"]
+    long = a < b
+
+    def band(v_from, v_to, z):
+        top = y(max(v_from, v_to))
+        bot = y(min(v_from, v_to))
+        return (f'<div class="lad-band z{z}" style="top:{top:.3f}%;'
+                f'height:{max(bot - top, 0):.3f}%"><i>{z}</i></div>')
+
+    bands = band(a, p1, 1) + band(p1, p2, 2) + band(p2, b, 3)
+
+    oor = info.get("outside") is not None
+    price_line = (
+        f'<div class="lad-price{" oor" if oor else ""}" style="top:{y(price):.3f}%">'
+        f'<span class="dot"></span></div>'
+    )
+
+    level_line = ""
+    if level is not None and lo <= level <= hi:
+        cls = "hit" if lvl_state == "reached" else ("off" if lvl_state == "expired" else "")
+        level_line = (
+            f'<div class="lad-level {cls}" style="top:{y(level):.3f}%">'
+            f'<span>{BELL if lvl_state == "reached" else ""}</span></div>'
+        )
+
+    top_label = "B" if long else "A"
+    bot_label = "A" if long else "B"
+    mid_hi_v, mid_lo_v = (p2, p1) if long else (p1, p2)
+
+    axis = (
+        f'<div class="lad-tick end" style="top:{y(hi):.3f}%">'
+        f'<b>{top_label}</b> {fmt_px(hi, decimals)}</div>'
+        f'<div class="lad-tick" style="top:{y(mid_hi_v):.3f}%">{fmt_px(mid_hi_v, decimals)}</div>'
+        f'<div class="lad-tick" style="top:{y(mid_lo_v):.3f}%">{fmt_px(mid_lo_v, decimals)}</div>'
+        f'<div class="lad-tick end" style="top:{y(lo):.3f}%">'
+        f'<b>{bot_label}</b> {fmt_px(lo, decimals)}</div>'
+    )
+
+    return (
+        f'<div class="ladder{" is-short" if not long else ""}">'
+        f'<div class="lad-bar">{bands}{level_line}{price_line}</div>'
+        f'<div class="lad-axis">{axis}</div>'
+        f'</div>'
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# СТРАНИЦА
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Калькулятор фьючерсов MOEX",
+    page_title="Калькулятор фьючерсов QCKSLVR TRADING",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
 st.markdown(
     """
-    <style>
-    @media (max-width: 640px) {
-        .block-container { padding-top: 0.5rem !important; padding-bottom: 0.5rem !important; }
-        .stApp > header { display: none; }
-        .mobile-col-3 > div { width: 33.33% !important; flex: 0 0 33.33% !important; padding: 0 2px !important; }
-        .mobile-col-2 > div { width: 50% !important; flex: 0 0 50% !important; padding: 0 2px !important; }
-        .stNumberInput { min-height: 2.2rem !important; }
-        .stNumberInput label { display: none !important; }
-        .stNumberInput input { height: 2.2rem !important; font-size: 14px !important; }
-        .stRadio > div { flex-direction: row !important; gap: 8px !important; }
-        .stRadio label { font-size: 13px !important; padding: 4px 8px !important; }
-        .streamlit-expanderHeader { font-size: 13px !important; padding: 0.3rem 0 !important; }
-        .stButton > button { padding: 0.3rem 0.5rem !important; font-size: 13px !important; }
-        .stSidebar h3 { font-size: 1rem !important; margin-bottom: 0.5rem !important; margin-top: 0.5rem !important; }
-        .stSidebar p { font-size: 0.8rem !important; color: #666 !important; margin-bottom: 0.8rem !important; }
-    }
-    
-    .stRadio div[role="radiogroup"] > label:has(> input[value="LONG"]) {
-        background-color: #e6f4ea !important; border: 2px solid #34a853 !important;
-        color: #137333 !important; font-weight: 600 !important; border-radius: 6px !important; padding: 8px 16px !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="SHORT"]) {
-        background-color: #fce8e6 !important; border: 2px solid #ea4335 !important;
-        color: #c5221f !important; font-weight: 600 !important; border-radius: 6px !important; padding: 8px 16px !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="LONG"]:checked) {
-        background-color: #34a853 !important; color: white !important;
-    }
-    .stRadio div[role="radiogroup"] > label:has(> input[value="SHORT"]:checked) {
-        background-color: #ea4335 !important; color: white !important;
-    }
-    
-    .compact-metrics {
-        display: flex; justify-content: space-between; align-items: center;
-        background: #f0f2f6; padding: 8px 12px; border-radius: 8px;
-        font-size: 0.85rem; margin-bottom: 8px; border: 1px solid #e0e0e0;
-    }
-    .compact-metrics .item { text-align: center; flex: 1; }
-    .compact-metrics .item b { display: block; font-size: 0.7rem; color: #666; text-transform: uppercase; }
-    .compact-metrics .item span { font-size: 0.95rem; font-weight: 600; color: #0e1117; }
-    
-    .zone-indicator {
-        padding: 8px 12px; border-radius: 6px; margin: 8px 0;
-        font-size: 0.85rem; font-weight: 600;
-    }
-    .zone-1 { background: #e6f4ea; border: 1px solid #34a853; color: #137333; }
-    .zone-2 { background: #fef7e0; border: 1px solid #f9ab00; color: #b06000; }
-    .zone-3 { background: #fce8e6; border: 1px solid #ea4335; color: #c5221f; }
-    
-    .sidebar-ref {
-        background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px;
-        padding: 6px 8px; margin-top: 4px; margin-bottom: 8px;
-    }
-    .sidebar-ref-item {
-        font-size: 0.75rem; color: #495057; padding: 2px 0;
-        border-bottom: 1px dashed #dee2e6;
-    }
-    .sidebar-ref-item:last-child { border-bottom: none; }
-    .sidebar-ref-dir { font-weight: 700; }
-    .dir-long { color: #137333; }
-    .dir-short { color: #c5221f; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+<style>
+:root{
+  --ink:#0B1220; --ink2:#16233A; --muted:#5A6577; --warm:#6B6459;
+  --paper:#F2F5FA; --surface:#FFFFFF; --surface2:#E9EEF6; --line:#D3DCEA;
+  --long:#0E9F6E; --long-deep:#046C4E; --long-soft:#E1F5EE;
+  --short:#E02424; --short-deep:#B01B1B; --short-soft:#FDE7E7;
+  --warn:#C2740A; --warn-soft:#FDF1D8;
+  --info:#1D4ED8; --info-soft:#E3E9FE;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+}
+html,body,[class*="css"]{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+}
+html, body { scroll-padding-top: 1.5rem; }
+.stApp{background:
+  radial-gradient(1100px 420px at 12% -8%, #E6EDFB 0%, rgba(230,237,251,0) 62%),
+  radial-gradient(760px 380px at 104% 4%, #E4F5EE 0%, rgba(228,245,238,0) 58%),
+  var(--paper);}
+.block-container{padding-top:1.4rem;padding-bottom:1.1rem;max-width:760px;}
+#MainMenu,footer{visibility:hidden;}
 
+.app-title{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  background:linear-gradient(104deg,var(--ink) 0%,var(--ink2) 46%,#22357A 100%);
+  color:#fff;border-radius:10px;padding:8px 12px;margin-bottom:9px;
+  box-shadow:0 6px 18px -10px rgba(11,18,32,.75);
+}
+.app-title-main{flex:1;min-width:0;}
+.app-title h1{font-size:.95rem;font-weight:700;margin:0;letter-spacing:.2px;}
+.app-title .sub{font-size:.63rem;color:#9FB2D8;font-family:var(--mono);letter-spacing:.4px;}
+.app-title .pulse{
+  font-size:.63rem;font-family:var(--mono);background:rgba(255,255,255,.10);
+  border:1px solid rgba(255,255,255,.20);border-radius:999px;padding:2px 8px;color:#DCE6FF;
+  white-space:nowrap;flex-shrink:0;
+}
+.app-title .pulse b{color:#FFD27A;}
 
-# ─────────────────────────────────────────────────────────────
-# ИНИЦИАЛИЗАЦИЯ SESSION STATE
-# ─────────────────────────────────────────────────────────────
-sheet_deposit, sheet_ticker_map = load_sheet_data()
+div[data-testid="stCheckbox"]{min-height:0;}
+div[data-testid="stCheckbox"] label{align-items:center;gap:7px;}
+div[data-testid="stCheckbox"] label p{
+  font-size:.72rem!important;font-weight:700;color:var(--ink2);letter-spacing:.2px;}
+div[data-testid="stCheckbox"] input[type="checkbox"]{accent-color:var(--info);}
+div[data-testid="stCheckbox"] label span:first-of-type{border-color:#B7C3D8!important;}
+div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
+  background:linear-gradient(140deg,var(--info),#3B6BF0)!important;
+  border-color:var(--info)!important;}
+.filter-chips{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end;align-items:center;
+  height:100%;padding-top:2px;}
 
-if "deposit_initialized" not in st.session_state:
-    st.session_state.deposit_input = sheet_deposit
-    st.session_state.deposit_initialized = True
+.strip{
+  display:flex;background:var(--surface);border:1px solid var(--line);
+  border-radius:9px;overflow:hidden;margin-bottom:8px;
+  box-shadow:0 1px 0 rgba(11,18,32,.03);
+}
+.strip .cell{flex:1;padding:6px 8px;text-align:center;border-left:1px solid var(--line);min-width:0;}
+.strip .cell:first-child{border-left:none;}
+.strip .k{display:block;font-size:.58rem;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);}
+.strip .v{display:block;font-family:var(--mono);font-size:.86rem;font-weight:600;
+  color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.strip.tint{background:linear-gradient(96deg,#EEF3FF 0%,#F4FAF7 100%);}
 
-if "margin_type" not in st.session_state:
-    st.session_state.margin_type = "КСУР"
+.desk{display:grid;grid-template-columns:146px 1fr;gap:10px;align-items:stretch;margin-bottom:8px;}
+.ladder{display:flex;gap:6px;height:126px;background:var(--surface);
+  border:1px solid var(--line);border-radius:9px;padding:8px 8px 8px 9px;}
+.lad-bar{position:relative;width:34px;flex:0 0 34px;border-radius:5px;overflow:hidden;
+  background:var(--surface2);box-shadow:inset 0 0 0 1px rgba(11,18,32,.07);}
+.lad-band{position:absolute;left:0;right:0;display:flex;align-items:center;justify-content:center;}
+.lad-band i{font-style:normal;font-size:.58rem;font-weight:700;font-family:var(--mono);opacity:.72;}
+.lad-band.z1{background:linear-gradient(180deg,#BFE9DA,#8FD9BF);color:var(--long-deep);}
+.lad-band.z2{background:linear-gradient(180deg,#FBE3B4,#F7D08A);color:#8A5308;}
+.lad-band.z3{background:linear-gradient(180deg,#F6BDBD,#EFA0A0);color:var(--short-deep);}
+.lad-price{position:absolute;left:-3px;right:-3px;height:0;border-top:2px solid var(--ink);
+  transform:translateY(-1px);z-index:4;filter:drop-shadow(0 0 3px rgba(11,18,32,.45));}
+.lad-price .dot{position:absolute;left:-1px;top:-4px;width:7px;height:7px;background:var(--ink);
+  transform:rotate(45deg);border-radius:1px;}
+.lad-price.oor{border-top-style:dashed;opacity:.55;}
+.lad-level{position:absolute;left:0;right:0;height:0;border-top:2px dashed var(--warn);
+  transform:translateY(-1px);z-index:3;}
+.lad-level span{position:absolute;right:-2px;top:-8px;font-size:.55rem;line-height:1;}
+.lad-level.hit{border-top-color:#8A5308;border-top-style:solid;}
+.lad-level.off{opacity:.32;}
+.lad-axis{position:relative;flex:1;min-width:0;}
+.lad-tick{position:absolute;left:0;transform:translateY(-50%);font-family:var(--mono);
+  font-size:.6rem;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums;}
+.lad-tick.end{color:var(--ink);font-weight:600;}
+.lad-tick.end b{color:var(--info);}
+.ladder.is-short .lad-tick.end b{color:var(--short-deep);}
 
+.desk-side{display:flex;flex-direction:column;gap:6px;min-width:0;}
+.src-tag{font-size:.58rem;letter-spacing:.5px;text-transform:uppercase;color:var(--warm);
+  font-family:var(--mono);}
+.zone-card{border-radius:9px;padding:7px 10px;border:1px solid var(--line);background:var(--surface);flex:1;
+  display:flex;flex-direction:column;justify-content:center;gap:2px;}
+.zone-card .zn{font-size:1.02rem;font-weight:700;font-family:var(--mono);line-height:1.1;}
+.zone-card .zl{font-size:.68rem;color:var(--muted);}
+.zone-card.z1{background:linear-gradient(100deg,var(--long-soft),#F6FCF9);border-color:#A9DFCB;}
+.zone-card.z1 .zn{color:var(--long-deep);}
+.zone-card.z2{background:linear-gradient(100deg,var(--warn-soft),#FFFBF2);border-color:#EBC98A;}
+.zone-card.z2 .zn{color:#8A5308;}
+.zone-card.z3{background:linear-gradient(100deg,var(--short-soft),#FFF7F7);border-color:#EFB3B3;}
+.zone-card.z3 .zn{color:var(--short-deep);}
+.zone-card.z0 .zn{color:var(--muted);}
+.lvl-line{font-size:.68rem;font-family:var(--mono);color:var(--ink);
+  background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:4px 8px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.lvl-line.hit{background:var(--warn-soft);border-color:#E3B96B;color:#7A4B06;font-weight:700;}
+.lvl-line.off{color:var(--muted);}
 
-# ─────────────────────────────────────────────────────────────
-# ЗАГРУЗКА ДАННЫХ MOEX (ДО САЙДБАРА)
-# ─────────────────────────────────────────────────────────────
-st.markdown("<h4 style='margin: 0 0 8px 0;'>Калькулятор фьючерсов MOEX</h4>", unsafe_allow_html=True)
+.hit-banner{
+  display:flex;align-items:center;gap:8px;background:linear-gradient(98deg,#FDF1D8,#FFF9EC);
+  border:1px solid #E3B96B;border-left:4px solid var(--warn);border-radius:8px;
+  padding:6px 10px;margin-bottom:8px;font-size:.74rem;color:#7A4B06;font-weight:600;
+  font-family:var(--mono);
+}
+.hit-banner .b{font-size:.9rem;}
 
-with st.spinner("Загрузка данных..."):
-    futures = fetch_futures()
-    ims = fetch_ims()
+.setup-apply{
+  background:var(--surface);border:1px solid var(--line);border-radius:9px;
+  padding:8px 10px;margin-bottom:6px;
+  display:flex;flex-direction:column;gap:6px;
+}
+.setup-apply-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
+}
+.setup-apply-title{
+  font-size:.62rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--muted);font-family:var(--mono);
+}
+.setup-values{
+  display:flex;gap:6px;flex-wrap:wrap;font-family:var(--mono);font-size:.68rem;
+}
+.setup-val{
+  background:var(--surface2);border:1px solid var(--line);border-radius:5px;
+  padding:3px 7px;color:var(--ink2);font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
+.setup-val b{color:var(--ink);font-weight:700;margin-right:3px;}
+.setup-val.empty{color:var(--muted);font-style:italic;background:transparent;border-style:dashed;}
 
-if futures.empty:
-    st.error("Не удалось загрузить список фьючерсов с MOEX ISS.")
-    st.stop()
+.lbl{font-size:.6rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--muted);margin:6px 0 3px;}
+div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-numeric:tabular-nums;}
+.stSelectbox div[data-baseweb="select"]>div{border-radius:8px;}
+.stSelectbox span{font-family:var(--mono);font-size:.82rem;}
 
-# margin_type теперь берется из session_state
-margin_type = st.session_state.margin_type
-futures = merge_margins(futures, ims, margin_type)
-futures = futures[(futures["PRICE"] > 0) & ((futures["GO_LONG"] > 0) | (futures["GO_SHORT"] > 0))].copy()
-
-if futures.empty:
-    st.warning("Нет контрактов с валидными ценой и ГО.")
-    st.stop()
-
-futures = futures.sort_values("SECID").reset_index(drop=True)
-instruments: dict[str, Instrument] = {row["SECID"]: _to_instrument(row) for _, row in futures.iterrows()}
-
-
-def format_ticker(t: str) -> str:
-    setups = sheet_ticker_map.get(t, [])
-    tw = setups[0]["tw"] if setups and setups[0]["tw"] else ""
-    return f"{t} ({tw})" if tw else t
-
-ticker = st.selectbox(
-    "Фьючерс", list(instruments.keys()),
-    format_func=format_ticker,
-    label_visibility="collapsed",
-    key="ticker_select"
-)
-
-if "last_ticker" not in st.session_state:
-    st.session_state.last_ticker = ticker
-elif st.session_state.last_ticker != ticker:
-    for key in TRADE_STATE_KEYS:
-        if key in st.session_state:
-            del st.session_state[key]
-    st.session_state.last_ticker = ticker
-
-inst = instruments[ticker]
-
-
-# ─────────────────────────────────────────────────────────────
-# САЙДБАР (ПОСЛЕ ЗАГРУЗКИ inst)
-# ─────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Депозит и риск на сделку")
-    st.markdown("Основные параметры для расчёта объёма позиции.")
-    
-    deposit = st.number_input(
-        "Депозит, руб.", min_value=0.0, 
-        step=1000.0, format="%.0f", key="deposit_input"
-    )
-    
-    st.markdown(
-        f"<div class='sidebar-ref'><div class='sidebar-ref-item'>Из таблицы (B1): <b>{fmt_n(sheet_deposit, 0)} руб.</b></div></div>",
-        unsafe_allow_html=True
-    )
-    
-    risk_pct = st.number_input("Риск на сделку, %", min_value=0.1, max_value=100.0, value=1.0, step=0.1)
-    
-    st.divider()
-    
-    st.header("Лимиты загрузки и RR")
-    st.markdown("Контроль нагрузки на депозит и минимальное соотношение риск/прибыль.")
-    
-    margin_util = st.number_input("Макс. загрузка ГО, %", min_value=10, max_value=100, value=100, step=10)
-    required_rr = st.number_input("Требуемый RR", min_value=0.5, max_value=20.0, value=3.0, step=0.5)
-    
-    # margin_type теперь синхронизируется через session_state
-    margin_type = st.selectbox(
-        "Категория риска (ГО)", 
-        MARGIN_LEVELS, 
-        index=MARGIN_LEVELS.index(st.session_state.margin_type),
-        format_func=lambda x: MARGIN_HINTS.get(x, x),
-        key="margin_type"
-    )
-    
-    st.divider()
-    
-    st.header("Зоны риска A-B")
-    st.markdown("Введите значения вручную, опираясь на справку ниже.")
-    
-    point_a = st.number_input(
-        "Точка A", value=None, step=1.0, format="%.2f", placeholder="Цена точки A", key="point_a_input"
-    )
-    point_b = st.number_input(
-        "Точка B", value=None, step=1.0, format="%.2f", placeholder="Цена точки B", key="point_b_input"
-    )
-    
-    st.markdown("<div style='font-size: 0.75rem; font-weight: 600; color: #666; margin-top: 8px;'>Справочные данные из таблицы:</div>", unsafe_allow_html=True)
-    
-    current_ticker = st.session_state.get("ticker_select", "")
-    setups = sheet_ticker_map.get(current_ticker, [])
-    
-    if setups:
-        ref_html = "<div class='sidebar-ref'>"
-        for s in setups:
-            dir_class = "dir-long" if s.get("dir") == "LONG" else "dir-short"
-            dir_text = s.get("dir") or "N/A"
-            a_text = fmt_n(s["a"], inst.decimals) if s["a"] is not None else "—"
-            b_text = fmt_n(s["b"], inst.decimals) if s["b"] is not None else "—"
-            ref_html += f"<div class='sidebar-ref-item'><span class='sidebar-ref-dir {dir_class}'>{dir_text}</span>: A={a_text}, B={b_text}</div>"
-        ref_html += "</div>"
-        st.markdown(ref_html, unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='sidebar-ref'><div class='sidebar-ref-item'>Данных для этого тикера нет</div></div>", unsafe_allow_html=True)
-    
-    st.divider()
-    if st.button("Обновить котировки", use_container_width=True):
-        fetch_futures.clear()
-        fetch_ims.clear()
-        load_sheet_data.clear()
-        st.rerun()
-
-
-# ─────────────────────────────────────────────────────────────
-# ОСНОВНОЙ ИНТЕРФЕЙС (ПРОДОЛЖЕНИЕ)
-# ─────────────────────────────────────────────────────────────
-st.markdown(
-    f"""
-    <div class="compact-metrics">
-        <div class="item"><b>Цена</b><span>{fmt_n(inst.price, inst.decimals)}</span></div>
-        <div class="item"><b>Шаг / Ст</b><span>{fmt_n(inst.min_step, inst.decimals)} / {fmt_n(inst.step_price, 2)} руб.</span></div>
-        <div class="item"><b>ГО ({margin_type})</b><span>L: {fmt_n(inst.go_long, 0)} / S: {fmt_n(inst.go_short, 0)} руб.</span></div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-current_zone, _ = determine_zone(inst.price, point_a, point_b)
-if current_zone is not None:
-    zone_class = f"zone-{current_zone}"
-    zone_text = {1: "Зона 1 (Идеальная)", 2: "Зона 2 (Повышенный риск)", 3: "Зона 3 (Запрещена)"}
-    st.markdown(f'<div class="zone-indicator {zone_class}">Текущая цена в {zone_text[current_zone]}</div>', unsafe_allow_html=True)
-else:
-    st.caption(f"1 пункт = {fmt_n(inst.point_value, 2)} руб. | Экспирация: {fmt_date(inst.expiry)}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ПАРАМЕТРЫ СДЕЛКИ
-# ─────────────────────────────────────────────────────────────
-direction = st.radio(
-    "Направление", ["LONG", "SHORT"], horizontal=True, index=0, 
-    label_visibility="collapsed", key="direction_radio"
-)
-sign = 1 if direction == "LONG" else -1
-
-fmt_in = f"%.{inst.decimals}f"
-step_ui = float(inst.min_step) if inst.min_step > 0 else 0.01
-
-st.markdown("<div style='font-size: 0.85rem; font-weight: 600; margin-bottom: 4px;'>Уровни цены</div>", unsafe_allow_html=True)
-c1, c2 = st.columns(2, gap="small")
-sl = c1.number_input("SL", value=None, step=step_ui, format=fmt_in, placeholder="Стоп-лосс", label_visibility="collapsed", key="sl_input")
-tp = c2.number_input("TP", value=None, step=step_ui, format=fmt_in, placeholder="Тейк-профит", label_visibility="collapsed", key="tp_input")
-
-st.markdown("<div style='font-size: 0.85rem; font-weight: 600; margin: 8px 0 4px 0;'>Точка входа</div>", unsafe_allow_html=True)
-ec1, ec2 = st.columns([3, 2], gap="small")
-p1 = ec1.number_input("Цена 1", value=None, step=step_ui, format=fmt_in, placeholder="Цена входа", label_visibility="collapsed", key="entry_p_0")
-q1 = ec2.number_input("Контр. 1", min_value=0, value=None, step=1, format="%d", placeholder="Кол-во", label_visibility="collapsed", key="entry_q_0")
-
-entries = []
-if p1 is not None:
-    entries.append({"price": p1, "qty": q1 if q1 is not None else 0})
-
-with st.expander("Добавить усреднение (до 3 точек)", expanded=False):
-    for i in range(1, 3):
-        ec1, ec2 = st.columns([3, 2], gap="small")
-        p = ec1.number_input(f"Цена {i+1}", value=None, step=step_ui, format=fmt_in, placeholder=f"Цена входа {i+1}", label_visibility="collapsed", key=f"entry_p_{i}")
-        q = ec2.number_input(f"Контр. {i+1}", min_value=0, value=None, step=1, format="%d", placeholder=f"Кол-во {i+1}", label_visibility="collapsed", key=f"entry_q_{i}")
-        if p is not None:
-            entries.append({"price": p, "qty": q if q is not None else 0})
-
-with_qty = [e for e in entries if e["qty"] > 0]
-
-if with_qty:
-    entries_qty_sum = sum(e["qty"] for e in with_qty)
-    avg_entry = sum(e["price"] * e["qty"] for e in with_qty) / entries_qty_sum
-elif entries:
-    avg_entry = entries[0]["price"]
-    entries_qty_sum = 0
-else:
-    avg_entry = None
-    entries_qty_sum = 0
-
-effective_qty = entries_qty_sum
-
-if avg_entry is not None and sl is not None and avg_entry != sl:
-    risk_pts = abs(avg_entry - sl)
-    raw_min_tp = avg_entry + sign * risk_pts * required_rr
-    min_tp = inst.round_price(raw_min_tp)
-    st.info(f"Мин. TP для RR 1:{fmt_n(required_rr, 1)} -> {fmt_n(min_tp, inst.decimals)}")
-
-
-# ─────────────────────────────────────────────────────────────
-# ВАЛИДАЦИЯ И РЕЗУЛЬТАТ
-# ─────────────────────────────────────────────────────────────
-have_prices = avg_entry is not None and sl is not None and tp is not None
-have_qty = effective_qty > 0
-warnings = []
-
-entry_zone, zone_boundaries = determine_zone(avg_entry, point_a, point_b)
-zone_blocked = False
-zone_reduction = 1.0
-zone_message = None
-
-# ИСПРАВЛЕННАЯ ЛОГИКА ЗОН:
-# Зона 1 (у точки A) — оптимальна для обоих направлений
-# Зона 2 (середина) — повышенный риск, сокращение на 50%
-# Зона 3 (у точки B) — запрещена для обоих направлений
-if entry_zone is not None and point_a is not None and point_b is not None:
-    if entry_zone == 3:
-        zone_blocked = True
-        zone_message = f"ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для {direction}. Высокий риск."
-    elif entry_zone == 2:
-        zone_reduction = 0.5
-        zone_message = "Повышенный риск: зона 2. Рекомендуется сократить объём на 50%."
-    else:
-        zone_message = f"Зона {entry_zone}: оптимальная для {direction}."
-
-if have_prices:
-    if direction == "LONG":
-        if sl >= avg_entry: warnings.append("SL должен быть ниже цены входа")
-        if tp <= avg_entry: warnings.append("TP должен быть выше цены входа")
-    else:
-        if sl <= avg_entry: warnings.append("SL должен быть выше цены входа")
-        if tp >= avg_entry: warnings.append("TP должен быть ниже цены входа")
-
-for w in warnings:
-    st.warning(w)
-
-if entry_zone is not None and zone_message:
-    zone_class = f"zone-{entry_zone}"
-    st.markdown(f'<div class="zone-indicator {zone_class}">{zone_message}</div>', unsafe_allow_html=True)
-
-st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-
-if zone_blocked:
-    st.error(zone_message)
-elif not have_prices:
-    st.info("Заполните цену входа, SL и TP для расчёта.")
-elif not have_qty:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    st.markdown(f"<div class='compact-metrics'><div class='item' style='flex:1'><b>Расчётный RR</b><span style='color: #0068c9'>{fmt_n(rr, 2)}</span></div></div>", unsafe_allow_html=True)
-    st.caption("Укажите количество контрактов для расчёта объёма и риска.")
-else:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-
-    sl_steps = sl_dist / inst.min_step
-    tp_steps = tp_dist / inst.min_step
-    risk_per_ct = sl_steps * inst.step_price
-    profit_per_ct = tp_steps * inst.step_price
-
-    margin = inst.margin(direction)
-    risk_budget = deposit * risk_pct / 100
-
-    qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
-    qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
-    qty_rec = min(qty_by_risk, qty_by_margin)
-    
-    qty_rec = int(qty_rec * zone_reduction)
-
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    total_risk = risk_per_ct * effective_qty
-    total_reward = profit_per_ct * effective_qty
-
-    rr_ok = (rr >= required_rr) and (sl_dist > 0) and (tp_dist > 0)
-    mm_ok = (effective_qty <= qty_rec) and not warnings and effective_qty > 0
-
-    st.markdown(
-        f"""
-        <div class="compact-metrics" style="background: #e8f4f8; border: 1px solid #d0e8f2;">
-            <div class="item"><b>RR</b><span style="color: {'#00cc00' if rr_ok else '#ff4b4b'}">{fmt_n(rr, 2)}</span></div>
-            <div class="item"><b>Риск/конт</b><span>{fmt_n(risk_per_ct, 0)} руб.</span></div>
-            <div class="item"><b>Реком. объём</b><span style="color: #0068c9">{fmt_n(qty_rec, 0)}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not mm_ok or not rr_ok:
-        if warnings:
-            st.error("Некорректные цены сделки")
-        elif effective_qty > qty_rec:
-            st.error(f"Объём {effective_qty} > реком. {qty_rec}")
-        elif not rr_ok:
-            ratio = rr / required_rr
-            safe_qty = int(math.floor(qty_rec * ratio))
-            if safe_qty < 1:
-                st.warning("RR слишком низкий. Рекомендуется пропустить сделку.")
-            elif effective_qty <= safe_qty:
-                st.info(f"RR ниже плана, но объём {effective_qty} <= безопасного {safe_qty}")
-            else:
-                new_risk = risk_per_ct * safe_qty
-                st.warning(f"Сократите до {safe_qty} конт. (риск снизится до {fmt_n(new_risk, 0)} руб.)")
-    else:
-        st.success(f"Сделка корректна: {effective_qty} конт. <= {qty_rec}, RR = {fmt_n(rr, 2)}")
-
-    with st.expander("Детали расчёта", expanded=False):
-        actual_risk_pct = (total_risk / deposit * 100) if deposit else 0
-        risk_exceeded = actual_risk_pct > risk_pct
-        risk_color = "#ea4335" if risk_exceeded else "#0e1117"
-        risk_style = f"color: {risk_color}; font-weight: 700;" if risk_exceeded else ""
-        
-        zone_info = ""
-        if entry_zone is not None and zone_boundaries is not None:
-            z1_low, z1_high, z2_low, z2_high, z3_low, z3_high = zone_boundaries
-            zone_info = f"""
-**Зоны риска A-B:**
-- Зона 1 (идеальная): {fmt_n(z1_low, inst.decimals)} — {fmt_n(z1_high, inst.decimals)}
-- Зона 2 (повышенный риск): {fmt_n(z2_low, inst.decimals)} — {fmt_n(z2_high, inst.decimals)}
-- Зона 3 (запрещена): {fmt_n(z3_low, inst.decimals)} — {fmt_n(z3_high, inst.decimals)}
-- Точка входа в зоне: **{entry_zone}**
-"""
-        
-        st.markdown(
-            f"""
-**Вход:** {fmt_n(avg_entry, inst.decimals)} | **Контрактов:** {fmt_n(effective_qty, 0)}
-
-**SL:** {fmt_n(sl_dist, inst.decimals)} пт = {fmt_n(sl_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(risk_per_ct, 2)} руб. / конт.**
-**TP:** {fmt_n(tp_dist, inst.decimals)} пт = {fmt_n(tp_steps, 1)} шагов x {fmt_n(inst.step_price, 2)} руб. = **{fmt_n(profit_per_ct, 2)} руб. / конт.**
-
-**Бюджет риска:** {fmt_n(deposit, 0)} руб. x {fmt_n(risk_pct, 1)}% = **{fmt_n(risk_budget, 0)} руб.**
-**Qty по риску:** {fmt_n(qty_by_risk, 0)} конт. | **Qty по ГО:** {fmt_n(qty_by_margin, 0)} конт.
-{f'**Корректировка зоны:** x{zone_reduction} (зона 2)' if zone_reduction < 1.0 else ''}
-
-**Итог на {fmt_n(effective_qty, 0)} конт.:**
-- Прибыль при TP: **+{fmt_n(total_reward, 2)} руб.**
-- Убыток при SL: **-{fmt_n(total_risk, 2)} руб.**
-- Фактический риск: <span style="{risk_style}">**{fmt_n(actual_risk_pct, 2)}%** от депозита</span>{' (ПРЕВЫШАЕТ УСТАНОВЛЕННЫЙ РИСК)' if risk_exceeded else ''}
-
-{zone_info}
-*Источник данных ГО: таблица клиринга MOEX ISS (параметр {margin_type})*
-""",
-            unsafe_allow_html=True,
-        )
+.stRadio div[role="radiogroup"]{gap:8px;}
+.stRadio div[role="radiogroup"]>label{
+  border-radius:8px;padding:6px 18px!important;font-weight:700;letter-spacing:.4px;
+  transition:transform .12s ease, box-shadow .12s ease;
+}
+.stRadio div[role="radiogroup"]>label:has(input[value="LONG"]){
+  background:var(--long-soft);border:2px solid var(--long);color:var(--long-deep);}
+.stRadio div[role="radiogroup"]>label:has(input[value="SHORT"]){
+  background:var(--short-soft);border:2px solid var(--short);color:var(--short-deep);}
+.stRadio div[role="radiogroup"]>label:has(input[value="LONG"]:checked){
+  background:linear-gradient(100deg,var(--long),#12B981);color:#fff;
+  box-shadow:0 5px 14px -7px rgba(14,159,110,.9);transform:translateY(-1px);}
+.stRadio div[role="radiogroup"]>label:has(input[value="SHORT"]:checked){
+  background:linear-gradient(100deg
