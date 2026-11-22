@@ -62,6 +62,9 @@ MOVE_CLASSES = {
     "Волна":     "move-wave",
 }
 
+# Ранжирование типов движения по приоритету (меньше — выше в списке)
+MOVE_RANK = {"Зигзаг": 0, "Тенденция": 1, "Волна": 2}
+
 
 # ─────────────────────────────────────────────────────────────
 # ЧИСЛА И ФОРМАТЫ
@@ -305,7 +308,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/14.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/15.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -488,11 +491,33 @@ def build_summary(instruments: dict, tmap: dict) -> list[dict]:
 
 def sort_summary(items: list[dict], mode: str) -> list[dict]:
     rank = {"reached": 0, "armed": 1, "none": 2, "expired": 3}
+
     if mode == "По тикеру":
         return sorted(items, key=lambda x: (x["ticker"], x["dir"]))
+
     if mode == "По зоне":
         return sorted(items, key=lambda x: (x["zone"] is None, x["zone"] or 9,
                                             x["ticker"], x["dir"]))
+
+    if mode == "По уровню":
+        # reached → наверх, armed → по расстоянию |price - level|, остальные → вниз
+        def _lvl_key(x):
+            if x["state"] == "reached":
+                return (0, 0.0, x["ticker"])
+            if x["state"] == "armed" and x.get("level") is not None:
+                return (1, abs(x["price"] - x["level"]), x["ticker"])
+            return (2, float("inf"), x["ticker"])
+        return sorted(items, key=_lvl_key)
+
+    if mode == "По движению":
+        # Зигзаг > Тенденция > Волна (сверху вниз)
+        def _move_key(x):
+            m = x.get("move")
+            m_rank = MOVE_RANK.get(m, 99) if m else 99
+            return (m_rank, x["ticker"], x["dir"])
+        return sorted(items, key=_move_key)
+
+    # По умолчанию — «По сигналу»
     return sorted(items, key=lambda x: (rank.get(x["state"], 9),
                                         x["zone"] is None, x["zone"] or 9,
                                         x["ticker"], x["dir"]))
@@ -684,7 +709,6 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
 }
 .hit-banner .b{font-size:.9rem;}
 
-/* ── БЛОК ПРИМЕНЕНИЯ СЕТАПА ИЗ ТАБЛИЦЫ ── */
 .setup-apply{
   background:var(--surface);border:1px solid var(--line);border-radius:9px;
   padding:8px 10px;margin-bottom:6px;
@@ -1046,7 +1070,7 @@ with st.sidebar:
     fcol2, scol2 = st.columns([1, 1], gap="small")
     only_hot = fcol2.checkbox("Только уровни", key="sum_only_hot")
     sort_mode = scol2.selectbox(
-        "Сортировка", ["По сигналу", "По зоне", "По тикеру"],
+        "Сортировка", ["По сигналу", "По уровню", "По движению", "По зоне", "По тикеру"],
         key="sum_sort", label_visibility="collapsed",
     )
 
@@ -1091,8 +1115,6 @@ with st.sidebar:
     st.header("Зоны риска A-B")
     st.markdown("Зона 1 у A — вход, зона 2 — объём ×0.5, зона 3 у B — запрет.")
 
-    # Кнопки A/B создаются ДО полей point_a_input / point_b_input,
-    # поэтому прямое присваивание здесь допустимо.
     if setups:
         st.markdown('<div class="lbl">Загрузить сетап (A/B)</div>', unsafe_allow_html=True)
         acols = st.columns(min(3, len(setups)), gap="small")
@@ -1338,8 +1360,6 @@ if trade_setups:
         st.rerun()
     elif btn_apply:
         ts = trade_setups[st.session_state.get(ts_idx_key, 0)]
-        # Откладываем применение: значения запишутся в начале следующего прогона,
-        # до создания виджетов (обход StreamlitWidgetAlreadyInstantiatedError)
         st.session_state["_pending_setup"] = ts
         st.session_state["_setup_msg"] = (
             f"Сетап применён: {ts['dir']} · "
