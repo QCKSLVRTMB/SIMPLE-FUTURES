@@ -93,7 +93,7 @@ def normalize_move(val) -> str | None:
     if val is None:
         return None
     s = str(val).strip().lower()
-    if not s or s in {"nan", "none", "—", "-", "нет", "—"}:
+    if not s or s in {"nan", "none", "—", "-", "нет"}:
         return None
     if "зигзаг" in s or "zigzag" in s:
         return "Зигзаг"
@@ -305,7 +305,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/13.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/14.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -687,7 +687,7 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
 /* ── БЛОК ПРИМЕНЕНИЯ СЕТАПА ИЗ ТАБЛИЦЫ ── */
 .setup-apply{
   background:var(--surface);border:1px solid var(--line);border-radius:9px;
-  padding:8px 10px;margin-bottom:8px;
+  padding:8px 10px;margin-bottom:6px;
   display:flex;flex-direction:column;gap:6px;
 }
 .setup-apply-head{
@@ -697,14 +697,6 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
   font-size:.62rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
   color:var(--muted);font-family:var(--mono);
 }
-.setup-apply-btn{
-  background:linear-gradient(100deg,var(--info),#3B6BF0)!important;
-  color:#fff!important;border:none!important;font-weight:700!important;
-  font-size:.72rem!important;padding:6px 14px!important;border-radius:6px!important;
-  font-family:var(--mono)!important;letter-spacing:.3px;
-  transition:transform .1s ease, box-shadow .1s ease;
-}
-.setup-apply-btn:hover{transform:translateY(-1px);box-shadow:0 4px 10px -4px rgba(29,78,216,.5);}
 .setup-values{
   display:flex;gap:6px;flex-wrap:wrap;font-family:var(--mono);font-size:.68rem;
 }
@@ -838,7 +830,6 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .chip.mini{font-size:.58rem;padding:1px 6px;}
   .move-tag{font-size:.52rem;padding:1px 4px;}
   .setup-apply{padding:6px 8px;}
-  .setup-apply-btn{font-size:.66rem!important;padding:5px 10px!important;}
   .setup-val{font-size:.62rem;padding:2px 5px;}
 }
 @media (max-width:360px){
@@ -852,6 +843,27 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 """,
     unsafe_allow_html=True,
 )
+
+# ─────────────────────────────────────────────────────────────
+# ОТЛОЖЕННОЕ ПРИМЕНЕНИЕ СЕТАПА
+# Выполняется ДО создания любых виджетов — иначе Streamlit
+# запрещает менять session_state уже созданных полей.
+# ─────────────────────────────────────────────────────────────
+_pending = st.session_state.pop("_pending_setup", None)
+if _pending:
+    if _pending.get("a") is not None:
+        st.session_state["point_a_input"] = float(_pending["a"])
+    if _pending.get("b") is not None:
+        st.session_state["point_b_input"] = float(_pending["b"])
+    if _pending.get("dir") is not None:
+        st.session_state["_dir_idx"] = 1 if _pending["dir"] == "SHORT" else 0
+        st.session_state.pop("direction_radio", None)
+    if _pending.get("entry") is not None:
+        st.session_state["entry_p_0"] = float(_pending["entry"])
+    if _pending.get("sl") is not None:
+        st.session_state["sl_input"] = float(_pending["sl"])
+    if _pending.get("tp") is not None:
+        st.session_state["tp_input"] = float(_pending["tp"])
 
 # ─────────────────────────────────────────────────────────────
 # ДАННЫЕ
@@ -967,6 +979,7 @@ if st.session_state.get("last_ticker") != ticker:
     for k in TRADE_STATE_KEYS:
         st.session_state.pop(k, None)
     st.session_state.pop("direction_radio", None)
+    st.session_state.pop("_setup_msg", None)
     dirs = {s["dir"] for s in sheet_map.get(ticker, []) if s.get("dir")}
     st.session_state["_dir_idx"] = 1 if dirs == {"SHORT"} else 0
     st.session_state["last_ticker"] = ticker
@@ -1078,16 +1091,17 @@ with st.sidebar:
     st.header("Зоны риска A-B")
     st.markdown("Зона 1 у A — вход, зона 2 — объём ×0.5, зона 3 у B — запрет.")
 
+    # Кнопки A/B создаются ДО полей point_a_input / point_b_input,
+    # поэтому прямое присваивание здесь допустимо.
     if setups:
         st.markdown('<div class="lbl">Загрузить сетап (A/B)</div>', unsafe_allow_html=True)
         acols = st.columns(min(3, len(setups)), gap="small")
         for i, s in enumerate(setups[:3]):
             label = f"{s['dir'] or '—'} {fmt_px(s['a'], dec)}"
             if acols[i].button(label, key=f"apply_ab_{ticker}_{i}", use_container_width=True):
-                st.session_state["point_a_input"] = s["a"]
-                st.session_state["point_b_input"] = s["b"]
-                st.session_state.pop("direction_radio", None)
-                st.session_state["_dir_idx"] = 1 if s["dir"] == "SHORT" else 0
+                st.session_state["_pending_setup"] = {"a": s.get("a"), "b": s.get("b"),
+                                                      "dir": s.get("dir")}
+                st.rerun()
 
     point_a = st.number_input(
         "Точка A", value=None, step=step_ui, format=fmt_in,
@@ -1302,7 +1316,6 @@ if trade_setups:
         unsafe_allow_html=True,
     )
 
-    # Кнопки управления (Streamlit)
     if len(trade_setups) > 1:
         nav_c1, nav_c2, nav_c3 = st.columns([1, 2, 1], gap="small")
         with nav_c1:
@@ -1317,7 +1330,6 @@ if trade_setups:
         btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}",
                               type="primary", use_container_width=True)
 
-    # Обработка нажатий
     if btn_prev:
         st.session_state[ts_idx_key] = (cur_ts_idx - 1) % len(trade_setups)
         st.rerun()
@@ -1326,25 +1338,20 @@ if trade_setups:
         st.rerun()
     elif btn_apply:
         ts = trade_setups[st.session_state.get(ts_idx_key, 0)]
-        if ts.get("a") is not None:
-            st.session_state["point_a_input"] = ts["a"]
-        if ts.get("b") is not None:
-            st.session_state["point_b_input"] = ts["b"]
-        if ts.get("dir") is not None:
-            st.session_state["_dir_idx"] = 1 if ts["dir"] == "SHORT" else 0
-            st.session_state["direction_radio"] = ts["dir"]
-        if ts.get("entry") is not None:
-            st.session_state["entry_p_0"] = ts["entry"]
-        if ts.get("sl") is not None:
-            st.session_state["sl_input"] = ts["sl"]
-        if ts.get("tp") is not None:
-            st.session_state["tp_input"] = ts["tp"]
-        st.success(
+        # Откладываем применение: значения запишутся в начале следующего прогона,
+        # до создания виджетов (обход StreamlitWidgetAlreadyInstantiatedError)
+        st.session_state["_pending_setup"] = ts
+        st.session_state["_setup_msg"] = (
             f"Сетап применён: {ts['dir']} · "
             f"Твх {fmt_px(ts.get('entry'), dec) if ts.get('entry') is not None else '—'} · "
             f"SL {fmt_px(ts.get('sl'), dec) if ts.get('sl') is not None else '—'} · "
             f"TP {fmt_px(ts.get('tp'), dec) if ts.get('tp') is not None else '—'}"
         )
+        st.rerun()
+
+_setup_msg = st.session_state.pop("_setup_msg", None)
+if _setup_msg:
+    st.success(_setup_msg)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1571,7 +1578,7 @@ else:
 **SL:** `{fmt_px(sl_dist, dec)}` пт = `{fmt_n(sl_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(risk_per_ct, 2)} ₽ / конт.**
 **TP:** `{fmt_px(tp_dist, dec)}` пт = `{fmt_n(tp_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(profit_per_ct, 2)} ₽ / конт.**
 
-**Бюджет риска:** `{fmt_n(deposit, 0)} ₽ × {fmt_n(risk_pct, 2)}%` = **{fmt_n(risk_budget, 2)} ₽**
+**Бюджет риска:** `{fmt_n(deposit, 2)} ₽ × {fmt_n(risk_pct, 2)}%` = **{fmt_n(risk_budget, 2)} ₽**
 **Qty по риску:** `{fmt_n(qty_by_risk, 0)}` · **Qty по ГО ({margin_type}):** `{fmt_n(qty_by_margin, 0)}` · **База:** `{fmt_n(qty_base, 0)}`
 **Рекомендуемый объём:** `{fmt_n(qty_base, 0)} × {fmt_n(zone_reduction, 2)}` = **{fmt_n(qty_rec, 0)} конт.**
 
