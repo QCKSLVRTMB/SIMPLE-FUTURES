@@ -56,7 +56,6 @@ ZONE_LABEL = {
     3: ("Зона 3", "высокий риск"),
 }
 
-# ── Типы результативного движения ──
 MOVE_CLASSES = {
     "Зигзаг":    "move-zigzag",
     "Тенденция": "move-trend",
@@ -91,11 +90,10 @@ def parse_number(val) -> float | None:
 
 
 def normalize_move(val) -> str | None:
-    """Нормализует значение столбца «Результативное движение»."""
     if val is None:
         return None
     s = str(val).strip().lower()
-    if not s or s in {"nan", "none", "—", "-", "нет", "—" }:
+    if not s or s in {"nan", "none", "—", "-", "нет", "—"}:
         return None
     if "зигзаг" in s or "zigzag" in s:
         return "Зигзаг"
@@ -145,7 +143,6 @@ def fmt_clock(ts: float | None) -> str:
 
 
 def move_tag_html(move: str | None) -> str:
-    """Компактный HTML-бейдж типа движения."""
     if not move or move not in MOVE_CLASSES:
         return ""
     cls = MOVE_CLASSES[move]
@@ -204,7 +201,8 @@ def load_sheet_data() -> tuple[float, dict, dict]:
     deposit = 100_000.0
     tmap: dict[str, list[dict]] = {}
     meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(),
-            "level_col": False, "move_col": False}
+            "level_col": False, "move_col": False,
+            "entry_col": False, "sl_col": False, "tp_col": False}
 
     try:
         raw = pd.read_csv(SHEET_URL, header=None, dtype=str, keep_default_na=False)
@@ -255,8 +253,18 @@ def load_sheet_data() -> tuple[float, dict, dict]:
     c_l = find(lambda n: "уровень" in n or "level" in n or n in {"ур", "ур.", "lvl"}, None)
     c_m = find(lambda n: ("движен" in n or "movement" in n or "move" in n
                           or n in {"тип", "type", "движ", "движ."}), None)
+    # Новые столбцы сделки: Твх (вход), SL, TP
+    c_entry = find(lambda n: ("твх" in n or "вход" in n or "entry" in n
+                              or n in {"цена входа", "цена", "price"}), None)
+    c_sl = find(lambda n: ("sl" in n or "стоп" in n or "stop" in n
+                           or n in {"стоп-лосс", "stop-loss", "стоп лосс"}), None)
+    c_tp = find(lambda n: ("tp" in n or "тейк" in n or "take" in n
+                           or n in {"тейк-профит", "take-profit", "тейк профит"}), None)
     meta["level_col"] = c_l is not None
     meta["move_col"] = c_m is not None
+    meta["entry_col"] = c_entry is not None
+    meta["sl_col"] = c_sl is not None
+    meta["tp_col"] = c_tp is not None
 
     def cell(row, idx):
         if idx is None or idx >= len(row):
@@ -273,10 +281,16 @@ def load_sheet_data() -> tuple[float, dict, dict]:
         b = parse_number(cell(row, c_b))
         lvl = parse_number(cell(row, c_l))
         move = normalize_move(cell(row, c_m))
+        entry = parse_number(cell(row, c_entry))
+        sl = parse_number(cell(row, c_sl))
+        tp = parse_number(cell(row, c_tp))
         d = None
         if a is not None and b is not None and a != b:
             d = "LONG" if a < b else "SHORT"
-        setup = {"tw": tw, "a": a, "b": b, "level": lvl, "dir": d, "move": move}
+        setup = {
+            "tw": tw, "a": a, "b": b, "level": lvl, "dir": d, "move": move,
+            "entry": entry, "sl": sl, "tp": tp,
+        }
         bucket = tmap.setdefault(t, [])
         if setup not in bucket:
             bucket.append(setup)
@@ -292,7 +306,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/11.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/12.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -466,6 +480,9 @@ def build_summary(instruments: dict, tmap: dict) -> list[dict]:
                 "a": s["a"],
                 "b": s["b"],
                 "move": s.get("move"),
+                "entry": s.get("entry"),
+                "sl": s.get("sl"),
+                "tp": s.get("tp"),
             })
     return out
 
@@ -565,7 +582,6 @@ st.markdown(
 html,body,[class*="css"]{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
 }
-/* Компенсация обрезания верхнего контента на мобильных браузерах */
 html, body { scroll-padding-top: 1.5rem; }
 .stApp{background:
   radial-gradient(1100px 420px at 12% -8%, #E6EDFB 0%, rgba(230,237,251,0) 62%),
@@ -590,7 +606,6 @@ html, body { scroll-padding-top: 1.5rem; }
 }
 .app-title .pulse b{color:#FFD27A;}
 
-/* ── фильтр списка ── */
 div[data-testid="stCheckbox"]{min-height:0;}
 div[data-testid="stCheckbox"] label{align-items:center;gap:7px;}
 div[data-testid="stCheckbox"] label p{
@@ -603,7 +618,6 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
 .filter-chips{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end;align-items:center;
   height:100%;padding-top:2px;}
 
-/* ── метрики ── */
 .strip{
   display:flex;background:var(--surface);border:1px solid var(--line);
   border-radius:9px;overflow:hidden;margin-bottom:8px;
@@ -616,7 +630,6 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
   color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .strip.tint{background:linear-gradient(96deg,#EEF3FF 0%,#F4FAF7 100%);}
 
-/* ── рабочий стол: лестница + статус ── */
 .desk{display:grid;grid-template-columns:146px 1fr;gap:10px;align-items:stretch;margin-bottom:8px;}
 .ladder{display:flex;gap:6px;height:126px;background:var(--surface);
   border:1px solid var(--line);border-radius:9px;padding:8px 8px 8px 9px;}
@@ -672,14 +685,44 @@ div[data-testid="stCheckbox"] label:has(input:checked) span:first-of-type{
 }
 .hit-banner .b{font-size:.9rem;}
 
-/* ── поля ── */
+/* ── БЛОК ПРИМЕНЕНИЯ СЕТАПА ИЗ ТАБЛИЦЫ ── */
+.setup-apply{
+  background:var(--surface);border:1px solid var(--line);border-radius:9px;
+  padding:8px 10px;margin-bottom:8px;
+  display:flex;flex-direction:column;gap:6px;
+}
+.setup-apply-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
+}
+.setup-apply-title{
+  font-size:.62rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--muted);font-family:var(--mono);
+}
+.setup-apply-btn{
+  background:linear-gradient(100deg,var(--info),#3B6BF0)!important;
+  color:#fff!important;border:none!important;font-weight:700!important;
+  font-size:.72rem!important;padding:6px 14px!important;border-radius:6px!important;
+  font-family:var(--mono)!important;letter-spacing:.3px;
+  transition:transform .1s ease, box-shadow .1s ease;
+}
+.setup-apply-btn:hover{transform:translateY(-1px);box-shadow:0 4px 10px -4px rgba(29,78,216,.5);}
+.setup-values{
+  display:flex;gap:6px;flex-wrap:wrap;font-family:var(--mono);font-size:.68rem;
+}
+.setup-val{
+  background:var(--surface2);border:1px solid var(--line);border-radius:5px;
+  padding:3px 7px;color:var(--ink2);font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
+.setup-val b{color:var(--ink);font-weight:700;margin-right:3px;}
+.setup-val.empty{color:var(--muted);font-style:italic;background:transparent;border-style:dashed;}
+
 .lbl{font-size:.6rem;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
   color:var(--muted);margin:6px 0 3px;}
 div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-numeric:tabular-nums;}
 .stSelectbox div[data-baseweb="select"]>div{border-radius:8px;}
 .stSelectbox span{font-family:var(--mono);font-size:.82rem;}
 
-/* ── LONG / SHORT ── */
 .stRadio div[role="radiogroup"]{gap:8px;}
 .stRadio div[role="radiogroup"]>label{
   border-radius:8px;padding:6px 18px!important;font-weight:700;letter-spacing:.4px;
@@ -697,7 +740,6 @@ div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-nume
   box-shadow:0 5px 14px -7px rgba(224,36,36,.9);transform:translateY(-1px);}
 .stRadio div[role="radiogroup"]>label p{font-size:.8rem;font-weight:700;}
 
-/* ── чипы результата ── */
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 7px;}
 .chip{font-family:var(--mono);font-size:.7rem;font-weight:700;border-radius:999px;
   padding:3px 10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);
@@ -708,7 +750,6 @@ div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-nume
 .chip.info{background:var(--info-soft);border-color:#B9C6F7;color:#1E3A8A;}
 .chip.mini{font-size:.62rem;padding:2px 8px;}
 
-/* ── сайдбар ── */
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#FFFFFF 0%,#F5F8FD 100%);
   border-right:1px solid var(--line);}
 section[data-testid="stSidebar"] h2{font-size:.86rem!important;font-weight:700;color:var(--ink);
@@ -726,18 +767,15 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 .ref-row:last-child{border-bottom:none;}
 .ref-row b.L{color:var(--long-deep);} .ref-row b.S{color:var(--short-deep);}
 .ref-row .lv{color:#8A5308;}
+.ref-row .trd{color:var(--info);}
 
-/* ── МЕТКИ ТИПА ДВИЖЕНИЯ ── */
 .move-tag{
   display:inline-block;font-family:var(--mono);font-size:.58rem;font-weight:700;
   letter-spacing:.3px;padding:1px 5px;border-radius:3px;margin-left:3px;
   vertical-align:middle;white-space:nowrap;
 }
-/* Зигзаг — красный (боковое/неопределённое движение) */
 .move-zigzag{background:var(--short-soft);color:var(--short-deep);border:1px solid #EFB3B3;}
-/* Тенденция — зелёный (устойчивое направленное движение) */
 .move-trend{background:var(--long-soft);color:var(--long-deep);border:1px solid #A9DFCB;}
-/* Волна — синий (сложное волновое движение) */
 .move-wave{background:var(--info-soft);color:#1E3A8A;border:1px solid #B9C6F7;}
 
 .sum-head{display:flex;gap:5px;align-items:center;margin:2px 0 4px;flex-wrap:wrap;}
@@ -774,7 +812,6 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 .stButton>button:hover{border-color:var(--info);transform:translateY(-1px);}
 .streamlit-expanderHeader{font-size:.74rem;font-weight:600;}
 
-/* ── МОБИЛЬНАЯ АДАПТАЦИЯ ── */
 @media (max-width:640px){
   .block-container{padding-top:1.2rem!important;padding-bottom:.6rem!important;}
   .stApp>header{display:none;}
@@ -801,6 +838,9 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
   .strip .v{font-size:.78rem;}
   .chip.mini{font-size:.58rem;padding:1px 6px;}
   .move-tag{font-size:.52rem;padding:1px 4px;}
+  .setup-apply{padding:6px 8px;}
+  .setup-apply-btn{font-size:.66rem!important;padding:5px 10px!important;}
+  .setup-val{font-size:.62rem;padding:2px 5px;}
 }
 @media (max-width:360px){
   .desk{grid-template-columns:118px 1fr;}
@@ -980,7 +1020,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── СВОДКА ПО АКТИВАМ ТАБЛИЦЫ ──
     st.header("Сводка по активам")
     st.markdown("Зона текущей цены по A/B из таблицы. 🟩 LONG · 🟥 SHORT · 1️⃣2️⃣3️⃣ зоны.")
 
@@ -1037,16 +1076,15 @@ with st.sidebar:
 
     st.divider()
 
-    # ── ЗОНЫ РИСКА A/B ──
     st.header("Зоны риска A-B")
     st.markdown("Зона 1 у A — вход, зона 2 — объём ×0.5, зона 3 у B — запрет.")
 
     if setups:
-        st.markdown('<div class="lbl">Загрузить сетап</div>', unsafe_allow_html=True)
+        st.markdown('<div class="lbl">Загрузить сетап (A/B)</div>', unsafe_allow_html=True)
         acols = st.columns(min(3, len(setups)), gap="small")
         for i, s in enumerate(setups[:3]):
             label = f"{s['dir'] or '—'} {fmt_px(s['a'], dec)}"
-            if acols[i].button(label, key=f"apply_{ticker}_{i}", use_container_width=True):
+            if acols[i].button(label, key=f"apply_ab_{ticker}_{i}", use_container_width=True):
                 st.session_state["point_a_input"] = s["a"]
                 st.session_state["point_b_input"] = s["b"]
                 st.session_state.pop("direction_radio", None)
@@ -1071,9 +1109,14 @@ with st.sidebar:
             lv = (f' · <span class="lv">ур {fmt_px(s["level"], dec)}</span>'
                   if s.get("level") is not None else "")
             mv = move_tag_html(s.get("move"))
+            # Сделка: Твх / SL / TP
+            entry_t = fmt_px(s["entry"], dec) if s.get("entry") is not None else "—"
+            sl_t = fmt_px(s["sl"], dec) if s.get("sl") is not None else "—"
+            tp_t = fmt_px(s["tp"], dec) if s.get("tp") is not None else "—"
+            trd = (f' · <span class="trd">Твх {entry_t} / SL {sl_t} / TP {tp_t}</span>')
             ref.append(
                 f'<div class="ref-row"><b class="{cls}">{s["dir"] or "—"}</b> '
-                f'A {a_t} · B {b_t}{lv}{mv}</div>'
+                f'A {a_t} · B {b_t}{lv}{trd}{mv}</div>'
             )
         st.markdown(f'<div class="ref">{"".join(ref)}</div>', unsafe_allow_html=True)
     else:
@@ -1093,14 +1136,15 @@ with st.sidebar:
 
     ims_note = "IMS подключён" if not ims.empty else "IMS недоступен — базовое ГО"
     sheet_note = "таблица OK" if sheet_meta["ok"] else "таблица недоступна"
-    lvl_note = "колонка «уровень» найдена" if sheet_meta["level_col"] else "колонки «уровень» нет"
-    move_note = ("колонка «движение» найдена" if sheet_meta["move_col"]
-                 else "колонки «движение» нет")
+    lvl_note = "«уровень»" if sheet_meta["level_col"] else "нет «уровня»"
+    move_note = "«движение»" if sheet_meta["move_col"] else "нет «движения»"
+    trade_note = ("«Твх/SL/TP»" if (sheet_meta["entry_col"] or sheet_meta["sl_col"] or sheet_meta["tp_col"])
+                  else "нет «Твх/SL/TP»")
     scope_note = "список: таблица" if filter_active else "список: все фьючерсы"
     st.markdown(
         f'<div class="meta-note">котировки {fmt_clock(fut_ts)} · таблица {fmt_clock(sheet_meta["ts"])}<br>'
         f'{len(instruments)} контрактов · {scope_note}<br>{ims_note}<br>'
-        f'{sheet_note} · {lvl_note} · {move_note}</div>',
+        f'{sheet_note} · {lvl_note} · {move_note} · {trade_note}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1207,6 +1251,116 @@ for s in setups:
             f'{fmt_px(s["level"], dec)}{move_html} — сигнал на вход</span></div>',
             unsafe_allow_html=True,
         )
+
+
+# ─────────────────────────────────────────────────────────────
+# БЛОК ПРИМЕНЕНИЯ СЕТАПА СДЕЛКИ ИЗ ТАБЛИЦЫ
+# ─────────────────────────────────────────────────────────────
+# Находим первый сетап с хотя бы одним полем сделки (entry/sl/tp)
+trade_setups = [s for s in setups if any(s.get(k) is not None for k in ("entry", "sl", "tp"))]
+
+if trade_setups:
+    # Текущий выбранный индекс сетапа сделки
+    cur_ts_idx = st.session_state.get(f"ts_idx_{ticker}", 0)
+    if cur_ts_idx >= len(trade_setups):
+        cur_ts_idx = 0
+        st.session_state[f"ts_idx_{ticker}"] = 0
+    cur_ts = trade_setups[cur_ts_idx]
+
+    # Собираем HTML-превью значений
+    def _val_chip(label: str, v, d: int) -> str:
+        if v is None:
+            return f'<span class="setup-val empty"><b>{label}</b>—</span>'
+        return f'<span class="setup-val"><b>{label}</b>{fmt_px(v, d)}</span>'
+
+    dir_chip = f'<span class="setup-val"><b>{DIR_EMOJI.get(cur_ts["dir"], "")}</b>{cur_ts["dir"]}</span>'
+    move_chip = move_tag_html(cur_ts.get("move"))
+
+    chips_html = (
+        f'<div class="setup-values">'
+        f'{dir_chip}'
+        f'{_val_chip("A", cur_ts.get("a"), dec)}'
+        f'{_val_chip("B", cur_ts.get("b"), dec)}'
+        f'{_val_chip("Твх", cur_ts.get("entry"), dec)}'
+        f'{_val_chip("SL", cur_ts.get("sl"), dec)}'
+        f'{_val_chip("TP", cur_ts.get("tp"), dec)}'
+        f'{move_chip}'
+        f'</div>'
+    )
+
+    # Навигация между сетапами (если их несколько)
+    nav_html = ""
+    if len(trade_setups) > 1:
+        nav_html = (
+            f'<span class="setup-apply-title" style="margin-right:4px;">'
+            f'сетап {cur_ts_idx + 1} / {len(trade_setups)}</span>'
+        )
+
+    st.markdown(
+        f'<div class="setup-apply">'
+        f'<div class="setup-apply-head">'
+        f'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+        f'<span class="setup-apply-title">Сделка из таблицы</span>'
+        f'{nav_html}'
+        f'</div>'
+        f'<div style="display:flex;gap:4px;flex-wrap:wrap;">'
+        + (f'<button class="setup-apply-btn" style="background:var(--surface2)!important;color:var(--ink2)!important;'
+           f'border:1px solid var(--line)!important;" '
+           f'onclick="document.getElementById(\'ts_prev_{ticker}\').click();return false;">◀</button>'
+           if len(trade_setups) > 1 else '')
+        + f'<button class="setup-apply-btn" '
+          f'onclick="document.getElementById(\'ts_apply_{ticker}\').click();return false;">'
+          f'ПРИМЕНИТЬ СЕТАП</button>'
+        + (f'<button class="setup-apply-btn" style="background:var(--surface2)!important;color:var(--ink2)!important;'
+           f'border:1px solid var(--line)!important;" '
+           f'onclick="document.getElementById(\'ts_next_{ticker}\').click();return false;">▶</button>'
+           if len(trade_setups) > 1 else '')
+        + f'</div></div>{chips_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Скрытые streamlit-кнопки для навигации и применения
+    nav_cols = st.columns([1, 1, 1] if len(trade_setups) > 1 else [1])
+    hidden_btns = []
+    if len(trade_setups) > 1:
+        with nav_cols[0]:
+            hidden_btns.append(st.button("◀", key=f"ts_prev_{ticker}"))
+    with nav_cols[0 if len(trade_setups) == 1 else 1]:
+        hidden_btns.append(st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary"))
+    if len(trade_setups) > 1:
+        with nav_cols[2]:
+            hidden_btns.append(st.button("▶", key=f"ts_next_{ticker}"))
+
+    # Обработка нажатий
+    if len(trade_setups) > 1 and hidden_btns[0]:
+        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx - 1) % len(trade_setups)
+        st.rerun()
+    if hidden_btns[-2 if len(trade_setups) > 1 else 0]:
+        # Применяем сетап
+        ts = trade_setups[st.session_state.get(f"ts_idx_{ticker}", 0)]
+        if ts.get("a") is not None:
+            st.session_state["point_a_input"] = ts["a"]
+        if ts.get("b") is not None:
+            st.session_state["point_b_input"] = ts["b"]
+        if ts.get("dir") is not None:
+            st.session_state["_dir_idx"] = 1 if ts["dir"] == "SHORT" else 0
+            st.session_state["direction_radio"] = ts["dir"]
+        # Поля сделки: только если в таблице есть значение
+        if ts.get("entry") is not None:
+            st.session_state["entry_p_0"] = ts["entry"]
+        if ts.get("sl") is not None:
+            st.session_state["sl_input"] = ts["sl"]
+        if ts.get("tp") is not None:
+            st.session_state["tp_input"] = ts["tp"]
+        st.success(
+            f"Сетап применён: {ts['dir']} · "
+            f"Твх {fmt_px(ts.get('entry'), dec) if ts.get('entry') is not None else '—'} · "
+            f"SL {fmt_px(ts.get('sl'), dec) if ts.get('sl') is not None else '—'} · "
+            f"TP {fmt_px(ts.get('tp'), dec) if ts.get('tp') is not None else '—'}"
+        )
+    if len(trade_setups) > 1 and len(hidden_btns) > 2 and hidden_btns[-1]:
+        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx + 1) % len(trade_setups)
+        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
