@@ -774,7 +774,7 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 
 /* ── МОБИЛЬНАЯ АДАПТАЦИЯ ── */
 @media (max-width:640px){
-  .block-container{padding-top:.45rem!important;padding-bottom:.6rem!important;}
+  .block-container{padding-top:1.2rem!important;padding-bottom:.6rem!important;}
   .stApp>header{display:none;}
   .app-title{
     flex-direction:column;align-items:stretch;gap:4px;
