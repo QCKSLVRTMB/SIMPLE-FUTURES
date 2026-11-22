@@ -1256,18 +1256,15 @@ for s in setups:
 # ─────────────────────────────────────────────────────────────
 # БЛОК ПРИМЕНЕНИЯ СЕТАПА СДЕЛКИ ИЗ ТАБЛИЦЫ
 # ─────────────────────────────────────────────────────────────
-# Находим первый сетап с хотя бы одним полем сделки (entry/sl/tp)
 trade_setups = [s for s in setups if any(s.get(k) is not None for k in ("entry", "sl", "tp"))]
 
 if trade_setups:
-    # Текущий выбранный индекс сетапа сделки
     cur_ts_idx = st.session_state.get(f"ts_idx_{ticker}", 0)
     if cur_ts_idx >= len(trade_setups):
         cur_ts_idx = 0
         st.session_state[f"ts_idx_{ticker}"] = 0
     cur_ts = trade_setups[cur_ts_idx]
 
-    # Собираем HTML-превью значений
     def _val_chip(label: str, v, d: int) -> str:
         if v is None:
             return f'<span class="setup-val empty"><b>{label}</b>—</span>'
@@ -1288,7 +1285,6 @@ if trade_setups:
         f'</div>'
     )
 
-    # Навигация между сетапами (если их несколько)
     nav_html = ""
     if len(trade_setups) > 1:
         nav_html = (
@@ -1319,25 +1315,34 @@ if trade_setups:
         unsafe_allow_html=True,
     )
 
-    # Скрытые streamlit-кнопки для навигации и применения
-    nav_cols = st.columns([1, 1, 1] if len(trade_setups) > 1 else [1])
-    hidden_btns = []
+    # Скрытые streamlit-кнопки
     if len(trade_setups) > 1:
+        nav_cols = st.columns([1, 1, 1])
         with nav_cols[0]:
-            hidden_btns.append(st.button("◀", key=f"ts_prev_{ticker}"))
-    with nav_cols[0 if len(trade_setups) == 1 else 1]:
-        hidden_btns.append(st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary"))
-    if len(trade_setups) > 1:
+            btn_prev = st.button("◀", key=f"ts_prev_{ticker}")
+        with nav_cols[1]:
+            btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary")
         with nav_cols[2]:
-            hidden_btns.append(st.button("▶", key=f"ts_next_{ticker}"))
+            btn_next = st.button("▶", key=f"ts_next_{ticker}")
+    else:
+        btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary")
+        btn_prev = False
+        btn_next = False
 
-    # Обработка нажатий
-    if len(trade_setups) > 1 and hidden_btns[0]:
+    # Обработка навигации (сразу rerun)
+    if len(trade_setups) > 1 and btn_prev:
         st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx - 1) % len(trade_setups)
         st.rerun()
-    if hidden_btns[-2 if len(trade_setups) > 1 else 0]:
-        # Применяем сетап
+    
+    if len(trade_setups) > 1 and btn_next:
+        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx + 1) % len(trade_setups)
+        st.rerun()
+
+    # Обработка применения сетапа — УСТАНОВИТЬ ЗНАЧЕНИЯ И СРАЗУ RERUN
+    if btn_apply:
         ts = trade_setups[st.session_state.get(f"ts_idx_{ticker}", 0)]
+        
+        # Устанавливаем все значения в session_state
         if ts.get("a") is not None:
             st.session_state["point_a_input"] = ts["a"]
         if ts.get("b") is not None:
@@ -1345,22 +1350,39 @@ if trade_setups:
         if ts.get("dir") is not None:
             st.session_state["_dir_idx"] = 1 if ts["dir"] == "SHORT" else 0
             st.session_state["direction_radio"] = ts["dir"]
-        # Поля сделки: только если в таблице есть значение
+        
+        # Поля сделки — только если в таблице есть значение
         if ts.get("entry") is not None:
             st.session_state["entry_p_0"] = ts["entry"]
         if ts.get("sl") is not None:
             st.session_state["sl_input"] = ts["sl"]
         if ts.get("tp") is not None:
             st.session_state["tp_input"] = ts["tp"]
-        st.success(
-            f"Сетап применён: {ts['dir']} · "
-            f"Твх {fmt_px(ts.get('entry'), dec) if ts.get('entry') is not None else '—'} · "
-            f"SL {fmt_px(ts.get('sl'), dec) if ts.get('sl') is not None else '—'} · "
-            f"TP {fmt_px(ts.get('tp'), dec) if ts.get('tp') is not None else '—'}"
-        )
-    if len(trade_setups) > 1 and len(hidden_btns) > 2 and hidden_btns[-1]:
-        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx + 1) % len(trade_setups)
+        
+        # Устанавливаем флаг применения для показа сообщения после rerun
+        st.session_state[f"applied_setup_{ticker}"] = {
+            "dir": ts.get("dir"),
+            "entry": ts.get("entry"),
+            "sl": ts.get("sl"),
+            "tp": ts.get("tp"),
+        }
+        
+        # СРАЗУ ВЫЗЫВАЕМ RERUN — это прервёт текущий прогон
+        # и запустит новый, где виджеты создадутся с новыми значениями
         st.rerun()
+
+# Показываем сообщение об успешном применении (после rerun)
+applied_key = f"applied_setup_{ticker}"
+if applied_key in st.session_state:
+    applied = st.session_state[applied_key]
+    st.success(
+        f"Сетап применён: {applied['dir']} · "
+        f"Твх {fmt_px(applied.get('entry'), dec) if applied.get('entry') is not None else '—'} · "
+        f"SL {fmt_px(applied.get('sl'), dec) if applied.get('sl') is not None else '—'} · "
+        f"TP {fmt_px(applied.get('tp'), dec) if applied.get('tp') is not None else '—'}"
+    )
+    # Очищаем флаг, чтобы сообщение не показывалось повторно
+    del st.session_state[applied_key]
 
 
 # ─────────────────────────────────────────────────────────────
