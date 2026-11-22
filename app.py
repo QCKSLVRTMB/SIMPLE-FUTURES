@@ -946,12 +946,12 @@ with st.sidebar:
 
     deposit = st.number_input(
         "Депозит, руб.", min_value=0.0, value=float(sheet_deposit),
-        step=1000.0, format="%.0f", key="deposit_input",
+        step=1000.0, format="%.2f", key="deposit_input",
     )
     st.markdown(
-        f'<div class="ref"><div class="ref-row">Таблица&nbsp;B1: <b>{fmt_n(sheet_deposit, 0)}</b> руб.</div></div>',
-        unsafe_allow_html=True,
-    )
+    f'<div class="ref"><div class="ref-row">Таблица&nbsp;B1: <b>{fmt_n(sheet_deposit, 2)}</b> руб.</div></div>',
+    unsafe_allow_html=True,
+)
     risk_pct = st.number_input(
         "Риск на сделку, %", min_value=0.1, max_value=100.0,
         value=1.0, step=0.1, key="risk_pct_input",
