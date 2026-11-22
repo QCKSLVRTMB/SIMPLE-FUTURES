@@ -1,4 +1,4 @@
-# app.py — Калькулятор фьючерсов MOEX · монитор уровней и зон A/B
+# app.py — Калькулятор фьючерсов MOEX · монитор уровней и зон A/B · с учётом комиссий
 from __future__ import annotations
 
 import math
@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from io import StringIO
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -17,9 +18,12 @@ from requests.adapters import HTTPAdapter, Retry
 # КОНСТАНТЫ
 # ─────────────────────────────────────────────────────────────
 ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
-SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0/export?format=csv"
+SHEET_ID = "1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+# Отдельный URL для листа "Комиссии" (gviz/tq позволяет указать имя листа)
+COMMISSIONS_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
+    f"?tqx=out:csv&sheet={quote('Комиссии')}"
 )
 
 MARGIN_LEVELS = ["НАЧ. ГО", "КНУР", "КСУР", "КПУР", "КОУР"]
@@ -62,8 +66,11 @@ MOVE_CLASSES = {
     "Волна":     "move-wave",
 }
 
-# Ранжирование типов движения по приоритету (меньше — выше в списке)
 MOVE_RANK = {"Зигзаг": 0, "Тенденция": 1, "Волна": 2}
+
+# Дефолтная комиссия (если тариф не найден в таблице)
+DEFAULT_COMMISSION_PCT = 0.05
+DEFAULT_MIN_COMMISSION = 2.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -193,35 +200,39 @@ def level_state(price, setup: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# GOOGLE SHEETS
+# GOOGLE SHEETS: ОСНОВНОЙ ЛИСТ
 # ─────────────────────────────────────────────────────────────
 def _norm(s) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip().lower())
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_sheet_data() -> tuple[float, dict, dict]:
+def load_sheet_data() -> tuple[float, dict, dict, str]:
+    """Возвращает: (депозит, маппинг тикеров, мета, название тарифа из E1)."""
     deposit = 100_000.0
     tmap: dict[str, list[dict]] = {}
     meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(),
             "level_col": False, "move_col": False,
             "entry_col": False, "sl_col": False, "tp_col": False}
+    tariff_name = ""
 
     try:
         raw = pd.read_csv(SHEET_URL, header=None, dtype=str, keep_default_na=False)
     except Exception as e:
         meta["error"] = f"{type(e).__name__}: {e}"
-        return deposit, tmap, meta
+        return deposit, tmap, meta, tariff_name
 
     if raw.empty:
         meta["error"] = "таблица пуста"
-        return deposit, tmap, meta
+        return deposit, tmap, meta, tariff_name
 
+    # Депозит — B1
     if raw.shape[1] > 1:
         v = parse_number(raw.iloc[0, 1])
         if v is not None and v > 0:
             deposit = v
 
+    # Резерв: слово «Депозит»
     if deposit == 100_000.0:
         for c in range(min(4, raw.shape[1])):
             hit = raw[raw[c].map(_norm).str.contains("депозит", na=False)]
@@ -231,6 +242,12 @@ def load_sheet_data() -> tuple[float, dict, dict]:
                     deposit = v
                     break
 
+    # Тариф из E1 (строка 0, столбец 4)
+    if raw.shape[1] > 4:
+        tariff_name = str(raw.iloc[0, 4]).strip()
+        if tariff_name.lower() in {"nan", "none", ""}:
+            tariff_name = ""
+
     hdr = None
     for i in range(min(30, len(raw))):
         if _norm(raw.iloc[i, 0]) in {"тикер", "ticker", "secid"}:
@@ -239,7 +256,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
     if hdr is None:
         meta["error"] = "не найдена строка заголовков «Тикер»"
         meta["ok"] = True
-        return deposit, tmap, meta
+        return deposit, tmap, meta, tariff_name
 
     names = [_norm(x) for x in raw.iloc[hdr].tolist()]
 
@@ -299,7 +316,95 @@ def load_sheet_data() -> tuple[float, dict, dict]:
         meta["rows"] += 1
 
     meta["ok"] = True
-    return deposit, tmap, meta
+    return deposit, tmap, meta, tariff_name
+
+
+# ─────────────────────────────────────────────────────────────
+# GOOGLE SHEETS: ЛИСТ "КОМИССИИ"
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_commissions() -> tuple[dict, dict]:
+    """
+    Возвращает:
+      - tariff_book: dict[name] = {"broker": str, "pct": float, "min": float}
+      - meta: {"ok": bool, "error": str|None, "ts": float}
+    """
+    book: dict[str, dict] = {}
+    meta = {"ok": False, "error": None, "ts": time.time()}
+
+    try:
+        raw = pd.read_csv(COMMISSIONS_URL, header=0, dtype=str, keep_default_na=False)
+    except Exception as e:
+        meta["error"] = f"{type(e).__name__}: {e}"
+        return book, meta
+
+    if raw.empty or raw.shape[1] < 3:
+        meta["error"] = "лист «Комиссии» пуст или имеет меньше 3 колонок"
+        return book, meta
+
+    # Нормализуем названия колонок
+    cols = [str(c).strip().lower() for c in raw.columns]
+
+    def find_col(*variants):
+        for v in variants:
+            for i, c in enumerate(cols):
+                if v in c:
+                    return i
+        return None
+
+    c_name = find_col("название", "тариф", "name") or 0
+    c_broker = find_col("брокер", "broker") or 1
+    c_pct = find_col("комиссия", "%", "pct", "rate")
+    c_min = find_col("мин", "min")
+
+    if c_pct is None:
+        c_pct = 2 if raw.shape[1] > 2 else None
+    if c_min is None and raw.shape[1] > 3:
+        c_min = 3
+
+    for _, row in raw.iterrows():
+        name = str(row.iloc[c_name]).strip()
+        if not name or name.lower() in {"nan", "none", ""}:
+            continue
+        broker = str(row.iloc[c_broker]).strip() if c_broker is not None else ""
+        pct = parse_number(row.iloc[c_pct]) if c_pct is not None else None
+        mn = parse_number(row.iloc[c_min]) if c_min is not None else None
+        if pct is None:
+            continue
+        book[name] = {
+            "broker": broker,
+            "pct": pct,
+            "min": mn if mn is not None else 0.0,
+        }
+
+    meta["ok"] = True
+    return book, meta
+
+
+def resolve_commission(tariff_name: str, book: dict) -> tuple[float, float, str, bool]:
+    """
+    Возвращает (pct, min_commission, resolved_name, found).
+    Если тариф не найден — возвращает дефолтные значения.
+    """
+    if not tariff_name:
+        return DEFAULT_COMMISSION_PCT, DEFAULT_MIN_COMMISSION, "", False
+    # Точное совпадение
+    if tariff_name in book:
+        rec = book[tariff_name]
+        return rec["pct"], rec["min"], tariff_name, True
+    # Нечувствительное к регистру
+    key = tariff_name.lower()
+    for name, rec in book.items():
+        if name.lower() == key:
+            return rec["pct"], rec["min"], name, True
+    return DEFAULT_COMMISSION_PCT, DEFAULT_MIN_COMMISSION, tariff_name, False
+
+
+def calc_commission(turnover: float, pct: float, min_comm: float) -> float:
+    """Комиссия за одну сторону сделки."""
+    if turnover <= 0:
+        return 0.0
+    return max(turnover * pct / 100.0, min_comm)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -500,7 +605,6 @@ def sort_summary(items: list[dict], mode: str) -> list[dict]:
                                             x["ticker"], x["dir"]))
 
     if mode == "По уровню":
-        # reached → наверх, armed → по расстоянию |price - level|, остальные → вниз
         def _lvl_key(x):
             if x["state"] == "reached":
                 return (0, 0.0, x["ticker"])
@@ -510,14 +614,12 @@ def sort_summary(items: list[dict], mode: str) -> list[dict]:
         return sorted(items, key=_lvl_key)
 
     if mode == "По движению":
-        # Зигзаг > Тенденция > Волна (сверху вниз)
         def _move_key(x):
             m = x.get("move")
             m_rank = MOVE_RANK.get(m, 99) if m else 99
             return (m_rank, x["ticker"], x["dir"])
         return sorted(items, key=_move_key)
 
-    # По умолчанию — «По сигналу»
     return sorted(items, key=lambda x: (rank.get(x["state"], 9),
                                         x["zone"] is None, x["zone"] or 9,
                                         x["ticker"], x["dir"]))
@@ -870,8 +972,6 @@ section[data-testid="stSidebar"] hr{margin:.55rem 0;border-color:var(--line);}
 
 # ─────────────────────────────────────────────────────────────
 # ОТЛОЖЕННОЕ ПРИМЕНЕНИЕ СЕТАПА
-# Выполняется ДО создания любых виджетов — иначе Streamlit
-# запрещает менять session_state уже созданных полей.
 # ─────────────────────────────────────────────────────────────
 _pending = st.session_state.pop("_pending_setup", None)
 if _pending:
@@ -892,7 +992,12 @@ if _pending:
 # ─────────────────────────────────────────────────────────────
 # ДАННЫЕ
 # ─────────────────────────────────────────────────────────────
-sheet_deposit, sheet_map, sheet_meta = load_sheet_data()
+sheet_deposit, sheet_map, sheet_meta, tariff_name_raw = load_sheet_data()
+commission_book, commission_meta = load_commissions()
+
+comm_pct, comm_min, resolved_tariff, tariff_found = resolve_commission(
+    tariff_name_raw, commission_book
+)
 
 level_cells = sum(1 for ss in sheet_map.values() for s in ss if s.get("level") is not None)
 st.markdown(
@@ -998,7 +1103,6 @@ ticker = st.selectbox(
     key="ticker_select",
 )
 
-# Сброс полей сделки — только при смене фьючерса
 if st.session_state.get("last_ticker") != ticker:
     for k in TRADE_STATE_KEYS:
         st.session_state.pop(k, None)
@@ -1053,6 +1157,34 @@ with st.sidebar:
         format_func=lambda x: MARGIN_HINTS.get(x, x),
         key="margin_type_sel",
     )
+
+    # ── БЛОК ТАРИФА ──
+    st.divider()
+    st.header("Торговый тариф")
+    if tariff_found:
+        st.markdown(
+            f'<div class="ref">'
+            f'<div class="ref-row"><b>{resolved_tariff}</b></div>'
+            f'<div class="ref-row">комиссия: {fmt_n(comm_pct, 3)}% · мин. {fmt_n(comm_min, 2)} ₽</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif tariff_name_raw:
+        st.markdown(
+            f'<div class="ref">'
+            f'<div class="ref-row" style="color:#B01B1B;">Тариф «{tariff_name_raw}» не найден</div>'
+            f'<div class="ref-row">используется дефолт: {fmt_n(DEFAULT_COMMISSION_PCT, 3)}% · мин. {fmt_n(DEFAULT_MIN_COMMISSION, 2)} ₽</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="ref">'
+            f'<div class="ref-row" style="color:var(--muted);">E1 не заполнен — дефолт</div>'
+            f'<div class="ref-row">комиссия: {fmt_n(DEFAULT_COMMISSION_PCT, 3)}% · мин. {fmt_n(DEFAULT_MIN_COMMISSION, 2)} ₽</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
@@ -1122,7 +1254,10 @@ with st.sidebar:
             label = f"{s['dir'] or '—'} {fmt_px(s['a'], dec)}"
             if acols[i].button(label, key=f"apply_ab_{ticker}_{i}", use_container_width=True):
                 st.session_state["_pending_setup"] = {"a": s.get("a"), "b": s.get("b"),
-                                                      "dir": s.get("dir")}
+                                                      "dir": s.get("dir"),
+                                                      "entry": s.get("entry"),
+                                                      "sl": s.get("sl"),
+                                                      "tp": s.get("tp")}
                 st.rerun()
 
     point_a = st.number_input(
@@ -1166,10 +1301,13 @@ with st.sidebar:
         fetch_futures.clear()
         fetch_ims.clear()
         load_sheet_data.clear()
+        load_commissions.clear()
         st.rerun()
 
     ims_note = "IMS подключён" if not ims.empty else "IMS недоступен — базовое ГО"
     sheet_note = "таблица OK" if sheet_meta["ok"] else "таблица недоступна"
+    comm_note = ("тарифы OK" if commission_meta["ok"]
+                 else f"тарифы: {commission_meta.get('error') or 'недоступны'}")
     lvl_note = "«уровень»" if sheet_meta["level_col"] else "нет «уровня»"
     move_note = "«движение»" if sheet_meta["move_col"] else "нет «движения»"
     trade_note = ("«Твх/SL/TP»" if (sheet_meta["entry_col"] or sheet_meta["sl_col"] or sheet_meta["tp_col"])
@@ -1178,7 +1316,7 @@ with st.sidebar:
     st.markdown(
         f'<div class="meta-note">котировки {fmt_clock(fut_ts)} · таблица {fmt_clock(sheet_meta["ts"])}<br>'
         f'{len(instruments)} контрактов · {scope_note}<br>{ims_note}<br>'
-        f'{sheet_note} · {lvl_note} · {move_note} · {trade_note}</div>',
+        f'{sheet_note} · {comm_note}<br>{lvl_note} · {move_note} · {trade_note}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1484,6 +1622,16 @@ if zone_message:
 
 
 # ─────────────────────────────────────────────────────────────
+# РАСЧЁТ КОМИССИЙ
+# ─────────────────────────────────────────────────────────────
+# Оборот одной стороны сделки = avg_entry × point_value × qty
+# Комиссия за круг = commission_one_way × 2 (вход + выход)
+turnover_one_way = (avg_entry or 0.0) * inst.point_value * effective_qty
+commission_one_way = calc_commission(turnover_one_way, comm_pct, comm_min)
+total_commission = commission_one_way * 2.0
+
+
+# ─────────────────────────────────────────────────────────────
 # РЕЗУЛЬТАТ
 # ─────────────────────────────────────────────────────────────
 if zone_blocked:
@@ -1520,11 +1668,19 @@ else:
     qty_base = min(qty_by_risk, qty_by_margin)
     qty_rec = int(qty_base * zone_reduction)
 
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    total_risk = risk_per_ct * effective_qty
-    total_reward = profit_per_ct * effective_qty
-    actual_risk_pct = (total_risk / deposit * 100) if deposit else 0.0
+    # Грязные значения (без комиссии)
+    gross_risk = risk_per_ct * effective_qty
+    gross_reward = profit_per_ct * effective_qty
 
+    # Чистые значения (с учётом комиссии за круг)
+    net_risk = gross_risk + total_commission
+    net_reward = max(gross_reward - total_commission, 0.0)
+    net_rr = (net_reward / net_risk) if net_risk > 0 else 0.0
+
+    # Для сравнения с лимитом риска используем чистый риск
+    actual_risk_pct = (net_risk / deposit * 100) if deposit else 0.0
+
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
     rr_ok = rr >= required_rr and sl_dist > 0 and tp_dist > 0
     mm_ok = effective_qty <= qty_rec and not warnings and effective_qty > 0
     risk_exceeded = actual_risk_pct > risk_pct + 1e-9
@@ -1532,14 +1688,15 @@ else:
     st.markdown(
         f"""
 <div class="strip tint">
-  <div class="cell"><span class="k">RR</span><span class="v" style="color:{'#046C4E' if rr_ok else '#B01B1B'}">{fmt_n(rr, 2)}</span></div>
-  <div class="cell"><span class="k">Риск / конт.</span><span class="v">{fmt_n(risk_per_ct, 2)} ₽</span></div>
+  <div class="cell"><span class="k">RR (грязный)</span><span class="v" style="color:{'#046C4E' if rr_ok else '#B01B1B'}">{fmt_n(rr, 2)}</span></div>
+  <div class="cell"><span class="k">RR (чистый)</span><span class="v" style="color:{'#046C4E' if net_rr >= required_rr else '#B01B1B'}">{fmt_n(net_rr, 2)}</span></div>
   <div class="cell"><span class="k">Реком. объём</span><span class="v" style="color:#1E3A8A">{fmt_n(qty_rec, 0)}</span></div>
 </div>
 <div class="chips">
-  <span class="chip {'ok' if rr_ok else 'bad'}">RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
+  <span class="chip info">комиссия за круг: {fmt_n(total_commission, 2)} ₽</span>
+  <span class="chip {'ok' if rr_ok else 'bad'}">грязный RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
+  <span class="chip {'ok' if net_rr >= required_rr else 'bad'}">чистый RR {fmt_n(net_rr, 2)} {'≥' if net_rr >= required_rr else '&lt;'} {fmt_n(required_rr, 2)}</span>
   <span class="chip {'ok' if mm_ok else 'bad'}">MM {fmt_n(effective_qty, 0)} {'≤' if mm_ok else '&gt;'} {fmt_n(qty_rec, 0)}</span>
-  <span class="chip {'bad' if risk_exceeded else 'ok'}">риск {fmt_n(actual_risk_pct, 2)}% / лимит {fmt_n(risk_pct, 2)}%</span>
 </div>
 """,
         unsafe_allow_html=True,
@@ -1591,6 +1748,11 @@ else:
         if level_block:
             level_block = "**Уровни из таблицы**\n" + level_block
 
+        tariff_display = resolved_tariff if tariff_found else (
+            f"{tariff_name_raw} (дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%)"
+            if tariff_name_raw else f"дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%"
+        )
+
         st.markdown(
             f"""
 **Вход:** `{fmt_px(avg_entry, dec)}` · **Контрактов:** `{fmt_n(effective_qty, 0)}` · **Направление:** `{direction}`
@@ -1602,10 +1764,18 @@ else:
 **Qty по риску:** `{fmt_n(qty_by_risk, 0)}` · **Qty по ГО ({margin_type}):** `{fmt_n(qty_by_margin, 0)}` · **База:** `{fmt_n(qty_base, 0)}`
 **Рекомендуемый объём:** `{fmt_n(qty_base, 0)} × {fmt_n(zone_reduction, 2)}` = **{fmt_n(qty_rec, 0)} конт.**
 
+**Комиссия (тариф: {tariff_display})**
+- Оборот одной стороны: `{fmt_n(turnover_one_way, 0)} ₽` = `{fmt_px(avg_entry, dec)}` × `{fmt_n(inst.point_value, 2)}` × `{fmt_n(effective_qty, 0)}`
+- Комиссия за сторону: `max({fmt_n(turnover_one_way, 0)} × {fmt_n(comm_pct, 3)}%, {fmt_n(comm_min, 2)})` = **{fmt_n(commission_one_way, 2)} ₽**
+- **Комиссия за круг (вход + выход):** **{fmt_n(total_commission, 2)} ₽**
+
 **Итог на {fmt_n(effective_qty, 0)} конт.**
-- Прибыль при TP: <span {reward_style}>+{fmt_n(total_reward, 2)} ₽</span>
-- Убыток при SL: <span {risk_style}>−{fmt_n(total_risk, 2)} ₽</span>
-- Фактический риск: <span {risk_style}>{fmt_n(actual_risk_pct, 2)}%</span> от депозита (лимит {fmt_n(risk_pct, 2)}%){' — **ПРЕВЫШЕНИЕ ЛИМИТА**' if risk_exceeded else ''}
+- Грязная прибыль при TP: <span {reward_style}>+{fmt_n(gross_reward, 2)} ₽</span>
+- Грязный убыток при SL: <span {risk_style}>−{fmt_n(gross_risk, 2)} ₽</span>
+- **Чистая прибыль при TP: <span {reward_style}>+{fmt_n(net_reward, 2)} ₽</span>**
+- **Чистый убыток при SL: <span {risk_style}>−{fmt_n(net_risk, 2)} ₽</span>**
+- Чистый RR: **{fmt_n(net_rr, 2)}**
+- Фактический риск (чистый): <span {risk_style}>{fmt_n(actual_risk_pct, 2)}%</span> от депозита (лимит {fmt_n(risk_pct, 2)}%){' — **ПРЕВЫШЕНИЕ ЛИМИТА**' if risk_exceeded else ''}
 - Загрузка ГО: `{fmt_n(margin * effective_qty, 0)} ₽` ({fmt_n((margin * effective_qty / deposit * 100) if deposit else 0, 2)}% депозита)
 
 {zone_block}
