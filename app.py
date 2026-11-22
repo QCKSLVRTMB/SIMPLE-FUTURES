@@ -253,7 +253,6 @@ def load_sheet_data() -> tuple[float, dict, dict]:
     c_l = find(lambda n: "уровень" in n or "level" in n or n in {"ур", "ур.", "lvl"}, None)
     c_m = find(lambda n: ("движен" in n or "movement" in n or "move" in n
                           or n in {"тип", "type", "движ", "движ."}), None)
-    # Новые столбцы сделки: Твх (вход), SL, TP
     c_entry = find(lambda n: ("твх" in n or "вход" in n or "entry" in n
                               or n in {"цена входа", "цена", "price"}), None)
     c_sl = find(lambda n: ("sl" in n or "стоп" in n or "stop" in n
@@ -306,7 +305,7 @@ def load_sheet_data() -> tuple[float, dict, dict]:
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "moex-futures-desk/12.0"})
+    s.headers.update({"User-Agent": "moex-futures-desk/13.0"})
     s.mount(
         "https://",
         HTTPAdapter(
@@ -1109,11 +1108,10 @@ with st.sidebar:
             lv = (f' · <span class="lv">ур {fmt_px(s["level"], dec)}</span>'
                   if s.get("level") is not None else "")
             mv = move_tag_html(s.get("move"))
-            # Сделка: Твх / SL / TP
             entry_t = fmt_px(s["entry"], dec) if s.get("entry") is not None else "—"
             sl_t = fmt_px(s["sl"], dec) if s.get("sl") is not None else "—"
             tp_t = fmt_px(s["tp"], dec) if s.get("tp") is not None else "—"
-            trd = (f' · <span class="trd">Твх {entry_t} / SL {sl_t} / TP {tp_t}</span>')
+            trd = f' · <span class="trd">Твх {entry_t} / SL {sl_t} / TP {tp_t}</span>'
             ref.append(
                 f'<div class="ref-row"><b class="{cls}">{s["dir"] or "—"}</b> '
                 f'A {a_t} · B {b_t}{lv}{trd}{mv}</div>'
@@ -1259,10 +1257,11 @@ for s in setups:
 trade_setups = [s for s in setups if any(s.get(k) is not None for k in ("entry", "sl", "tp"))]
 
 if trade_setups:
-    cur_ts_idx = st.session_state.get(f"ts_idx_{ticker}", 0)
+    ts_idx_key = f"ts_idx_{ticker}"
+    cur_ts_idx = st.session_state.get(ts_idx_key, 0)
     if cur_ts_idx >= len(trade_setups):
         cur_ts_idx = 0
-        st.session_state[f"ts_idx_{ticker}"] = 0
+        st.session_state[ts_idx_key] = 0
     cur_ts = trade_setups[cur_ts_idx]
 
     def _val_chip(label: str, v, d: int) -> str:
@@ -1285,9 +1284,9 @@ if trade_setups:
         f'</div>'
     )
 
-    nav_html = ""
+    nav_label = ""
     if len(trade_setups) > 1:
-        nav_html = (
+        nav_label = (
             f'<span class="setup-apply-title" style="margin-right:4px;">'
             f'сетап {cur_ts_idx + 1} / {len(trade_setups)}</span>'
         )
@@ -1297,52 +1296,36 @@ if trade_setups:
         f'<div class="setup-apply-head">'
         f'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
         f'<span class="setup-apply-title">Сделка из таблицы</span>'
-        f'{nav_html}'
+        f'{nav_label}'
         f'</div>'
-        f'<div style="display:flex;gap:4px;flex-wrap:wrap;">'
-        + (f'<button class="setup-apply-btn" style="background:var(--surface2)!important;color:var(--ink2)!important;'
-           f'border:1px solid var(--line)!important;" '
-           f'onclick="document.getElementById(\'ts_prev_{ticker}\').click();return false;">◀</button>'
-           if len(trade_setups) > 1 else '')
-        + f'<button class="setup-apply-btn" '
-          f'onclick="document.getElementById(\'ts_apply_{ticker}\').click();return false;">'
-          f'ПРИМЕНИТЬ СЕТАП</button>'
-        + (f'<button class="setup-apply-btn" style="background:var(--surface2)!important;color:var(--ink2)!important;'
-           f'border:1px solid var(--line)!important;" '
-           f'onclick="document.getElementById(\'ts_next_{ticker}\').click();return false;">▶</button>'
-           if len(trade_setups) > 1 else '')
-        + f'</div></div>{chips_html}</div>',
+        f'</div>{chips_html}</div>',
         unsafe_allow_html=True,
     )
 
-    # Скрытые streamlit-кнопки
+    # Кнопки управления (Streamlit)
     if len(trade_setups) > 1:
-        nav_cols = st.columns([1, 1, 1])
-        with nav_cols[0]:
-            btn_prev = st.button("◀", key=f"ts_prev_{ticker}")
-        with nav_cols[1]:
-            btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary")
-        with nav_cols[2]:
-            btn_next = st.button("▶", key=f"ts_next_{ticker}")
+        nav_c1, nav_c2, nav_c3 = st.columns([1, 2, 1], gap="small")
+        with nav_c1:
+            btn_prev = st.button("◀ Пред.", key=f"ts_prev_{ticker}", use_container_width=True)
+        with nav_c2:
+            btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}",
+                                  type="primary", use_container_width=True)
+        with nav_c3:
+            btn_next = st.button("След. ▶", key=f"ts_next_{ticker}", use_container_width=True)
     else:
-        btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}", type="primary")
-        btn_prev = False
-        btn_next = False
+        btn_prev, btn_next = False, False
+        btn_apply = st.button("ПРИМЕНИТЬ СЕТАП", key=f"ts_apply_{ticker}",
+                              type="primary", use_container_width=True)
 
-    # Обработка навигации (сразу rerun)
-    if len(trade_setups) > 1 and btn_prev:
-        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx - 1) % len(trade_setups)
+    # Обработка нажатий
+    if btn_prev:
+        st.session_state[ts_idx_key] = (cur_ts_idx - 1) % len(trade_setups)
         st.rerun()
-    
-    if len(trade_setups) > 1 and btn_next:
-        st.session_state[f"ts_idx_{ticker}"] = (cur_ts_idx + 1) % len(trade_setups)
+    elif btn_next:
+        st.session_state[ts_idx_key] = (cur_ts_idx + 1) % len(trade_setups)
         st.rerun()
-
-    # Обработка применения сетапа — УСТАНОВИТЬ ЗНАЧЕНИЯ И СРАЗУ RERUN
-    if btn_apply:
-        ts = trade_setups[st.session_state.get(f"ts_idx_{ticker}", 0)]
-        
-        # Устанавливаем все значения в session_state
+    elif btn_apply:
+        ts = trade_setups[st.session_state.get(ts_idx_key, 0)]
         if ts.get("a") is not None:
             st.session_state["point_a_input"] = ts["a"]
         if ts.get("b") is not None:
@@ -1350,39 +1333,18 @@ if trade_setups:
         if ts.get("dir") is not None:
             st.session_state["_dir_idx"] = 1 if ts["dir"] == "SHORT" else 0
             st.session_state["direction_radio"] = ts["dir"]
-        
-        # Поля сделки — только если в таблице есть значение
         if ts.get("entry") is not None:
             st.session_state["entry_p_0"] = ts["entry"]
         if ts.get("sl") is not None:
             st.session_state["sl_input"] = ts["sl"]
         if ts.get("tp") is not None:
             st.session_state["tp_input"] = ts["tp"]
-        
-        # Устанавливаем флаг применения для показа сообщения после rerun
-        st.session_state[f"applied_setup_{ticker}"] = {
-            "dir": ts.get("dir"),
-            "entry": ts.get("entry"),
-            "sl": ts.get("sl"),
-            "tp": ts.get("tp"),
-        }
-        
-        # СРАЗУ ВЫЗЫВАЕМ RERUN — это прервёт текущий прогон
-        # и запустит новый, где виджеты создадутся с новыми значениями
-        st.rerun()
-
-# Показываем сообщение об успешном применении (после rerun)
-applied_key = f"applied_setup_{ticker}"
-if applied_key in st.session_state:
-    applied = st.session_state[applied_key]
-    st.success(
-        f"Сетап применён: {applied['dir']} · "
-        f"Твх {fmt_px(applied.get('entry'), dec) if applied.get('entry') is not None else '—'} · "
-        f"SL {fmt_px(applied.get('sl'), dec) if applied.get('sl') is not None else '—'} · "
-        f"TP {fmt_px(applied.get('tp'), dec) if applied.get('tp') is not None else '—'}"
-    )
-    # Очищаем флаг, чтобы сообщение не показывалось повторно
-    del st.session_state[applied_key]
+        st.success(
+            f"Сетап применён: {ts['dir']} · "
+            f"Твх {fmt_px(ts.get('entry'), dec) if ts.get('entry') is not None else '—'} · "
+            f"SL {fmt_px(ts.get('sl'), dec) if ts.get('sl') is not None else '—'} · "
+            f"TP {fmt_px(ts.get('tp'), dec) if ts.get('tp') is not None else '—'}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
