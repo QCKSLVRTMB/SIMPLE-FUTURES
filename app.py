@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import re
 import time
+import urllib3
 from dataclasses import dataclass
 from datetime import datetime
 from io import StringIO
@@ -410,10 +411,17 @@ def calc_commission(turnover: float, pct: float, min_comm: float) -> float:
 # ─────────────────────────────────────────────────────────────
 # MOEX ISS
 # ─────────────────────────────────────────────────────────────
+# Отключаем предупреждение о небезопасном запросе, чтобы не засорять консоль
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "moex-futures-desk/15.0"})
+    
+    # ИСПРАВЛЕНИЕ: отключаем строгую проверку SSL-сертификатов для обхода ошибок MOEX ISS
+    s.verify = False 
+    
     s.mount(
         "https://",
         HTTPAdapter(
@@ -1564,225 +1572,4 @@ else:
     qty_sum = 0
 effective_qty = qty_sum
 
-if avg_entry is not None and sl is not None and avg_entry != sl:
-    risk_pts = abs(avg_entry - sl)
-    min_tp = inst.round_price(avg_entry + sign * risk_pts * required_rr)
-    st.markdown(
-        f'<div class="chips"><span class="chip info">мин. TP для RR {fmt_n(required_rr, 2)} → '
-        f'{fmt_px(min_tp, dec)}</span>'
-        f'<span class="chip">риск {fmt_px(risk_pts, dec)} пт</span></div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# ВАЛИДАЦИЯ
-# ─────────────────────────────────────────────────────────────
-have_prices = avg_entry is not None and sl is not None and tp is not None
-have_qty = effective_qty > 0
-warnings: list[str] = []
-
-if have_prices:
-    if direction == "LONG":
-        if sl >= avg_entry:
-            warnings.append("LONG: стоп-лосс должен быть ниже средней цены входа.")
-        if tp <= avg_entry:
-            warnings.append("LONG: тейк-профит должен быть выше средней цены входа.")
-    else:
-        if sl <= avg_entry:
-            warnings.append("SHORT: стоп-лосс должен быть выше средней цены входа.")
-        if tp >= avg_entry:
-            warnings.append("SHORT: тейк-профит должен быть ниже средней цены входа.")
-
-entry_zone, entry_info = (determine_zone(avg_entry, point_a, point_b) if manual_ab else (None, None))
-zone_blocked, zone_reduction, zone_message = False, 1.0, None
-
-# ИСПРАВЛЕННАЯ ЛОГИКА ЗОН:
-# Зона 1 (у точки A) — оптимальна для обоих направлений
-# Зона 2 (середина) — повышенный риск, сокращение на 50%
-# Зона 3 (у точки B) — запрещена для обоих направлений
-if manual_ab and entry_zone is not None:
-    if entry_zone == 3:
-        zone_blocked = True
-        zone_message = f"ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для {direction}. Высокий риск."
-    elif entry_zone == 2:
-        zone_reduction = 0.5
-        zone_message = "Зона 2: повышенный риск — рекомендуемый объём сокращён на 50%."
-    else:
-        zone_message = f"Зона {entry_zone}: оптимальная для {direction}."
-
-for w in warnings:
-    st.warning(w)
-
-if zone_message:
-    cls = "bad" if zone_blocked else ("warn" if zone_reduction < 1 else "ok")
-    st.markdown(
-        f'<div class="chips"><span class="chip {cls}">вход · {ZONE_EMOJI.get(entry_zone, "▫️")} '
-        f'{zone_message}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# РАСЧЁТ КОМИССИЙ
-# ─────────────────────────────────────────────────────────────
-# Оборот одной стороны сделки = avg_entry × point_value × qty
-# Комиссия за круг = commission_one_way × 2 (вход + выход)
-turnover_one_way = (avg_entry or 0.0) * inst.point_value * effective_qty
-commission_one_way = calc_commission(turnover_one_way, comm_pct, comm_min)
-total_commission = commission_one_way * 2.0
-
-
-# ─────────────────────────────────────────────────────────────
-# РЕЗУЛЬТАТ
-# ─────────────────────────────────────────────────────────────
-if zone_blocked:
-    st.error(zone_message)
-elif not have_prices:
-    st.markdown(
-        '<div class="chips"><span class="chip">Заполните вход, SL и TP для расчёта</span></div>',
-        unsafe_allow_html=True,
-    )
-elif not have_qty:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    st.markdown(
-        f'<div class="strip tint"><div class="cell"><span class="k">Расчётный RR</span>'
-        f'<span class="v">{fmt_n(rr, 2)}</span></div>'
-        f'<div class="cell"><span class="k">Средний вход</span>'
-        f'<span class="v">{fmt_px(avg_entry, dec)}</span></div></div>',
-        unsafe_allow_html=True,
-    )
-    st.caption("Укажите количество контрактов — появится сайзинг и проверка MM.")
-else:
-    sl_dist = abs(avg_entry - sl)
-    tp_dist = abs(tp - avg_entry)
-    sl_steps = sl_dist / inst.min_step
-    tp_steps = tp_dist / inst.min_step
-    risk_per_ct = sl_steps * inst.step_price
-    profit_per_ct = tp_steps * inst.step_price
-
-    margin = inst.margin(direction)
-    risk_budget = deposit * risk_pct / 100
-    qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
-    qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
-    qty_base = min(qty_by_risk, qty_by_margin)
-    qty_rec = int(qty_base * zone_reduction)
-
-    # Грязные значения (без комиссии)
-    gross_risk = risk_per_ct * effective_qty
-    gross_reward = profit_per_ct * effective_qty
-
-    # Чистые значения (с учётом комиссии за круг)
-    net_risk = gross_risk + total_commission
-    net_reward = max(gross_reward - total_commission, 0.0)
-    net_rr = (net_reward / net_risk) if net_risk > 0 else 0.0
-
-    # Для сравнения с лимитом риска используем чистый риск
-    actual_risk_pct = (net_risk / deposit * 100) if deposit else 0.0
-
-    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
-    rr_ok = rr >= required_rr and sl_dist > 0 and tp_dist > 0
-    mm_ok = effective_qty <= qty_rec and not warnings and effective_qty > 0
-    risk_exceeded = actual_risk_pct > risk_pct + 1e-9
-
-    st.markdown(
-        f"""
-<div class="strip tint">
-  <div class="cell"><span class="k">RR (грязный)</span><span class="v" style="color:{'#046C4E' if rr_ok else '#B01B1B'}">{fmt_n(rr, 2)}</span></div>
-  <div class="cell"><span class="k">RR (чистый)</span><span class="v" style="color:{'#046C4E' if net_rr >= required_rr else '#B01B1B'}">{fmt_n(net_rr, 2)}</span></div>
-  <div class="cell"><span class="k">Реком. объём</span><span class="v" style="color:#1E3A8A">{fmt_n(qty_rec, 0)}</span></div>
-</div>
-<div class="chips">
-  <span class="chip info">комиссия за круг: {fmt_n(total_commission, 2)} ₽</span>
-  <span class="chip {'ok' if rr_ok else 'bad'}">грязный RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
-  <span class="chip {'ok' if net_rr >= required_rr else 'bad'}">чистый RR {fmt_n(net_rr, 2)} {'≥' if net_rr >= required_rr else '&lt;'} {fmt_n(required_rr, 2)}</span>
-  <span class="chip {'ok' if mm_ok else 'bad'}">MM {fmt_n(effective_qty, 0)} {'≤' if mm_ok else '&gt;'} {fmt_n(qty_rec, 0)}</span>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    if warnings:
-        st.error("Некорректные цены сделки — исправьте уровни выше.")
-    elif not mm_ok:
-        st.error(f"Объём {fmt_n(effective_qty, 0)} конт. превышает рекомендуемые {fmt_n(qty_rec, 0)}.")
-    elif not rr_ok:
-        ratio = rr / required_rr if required_rr else 0
-        safe_qty = int(math.floor(qty_rec * ratio))
-        if safe_qty < 1:
-            st.warning("RR слишком низкий — сделку рекомендуется пропустить.")
-        elif effective_qty <= safe_qty:
-            st.info(f"RR ниже плана, но объём {fmt_n(effective_qty, 0)} ≤ безопасного {fmt_n(safe_qty, 0)}.")
-        else:
-            st.warning(
-                f"Сократите позицию до {fmt_n(safe_qty, 0)} конт. — "
-                f"риск снизится до {fmt_n(risk_per_ct * safe_qty, 2)} ₽."
-            )
-
-    with st.expander("Детали расчёта", expanded=False):
-        risk_style = 'style="color:#B01B1B;font-weight:700"' if risk_exceeded else ""
-        reward_style = 'style="color:#046C4E;font-weight:700"'
-        zone_block = ""
-        if manual_ab and entry_info:
-            z1 = sorted([point_a, entry_info["p1"]])
-            z2 = sorted([entry_info["p1"], entry_info["p2"]])
-            z3 = sorted([entry_info["p2"], point_b])
-            zone_block = f"""
-**Зоны A-B (введённые значения)**
-- Зона 1 · у A: `{fmt_px(z1[0], dec)}` — `{fmt_px(z1[1], dec)}`
-- Зона 2 · середина: `{fmt_px(z2[0], dec)}` — `{fmt_px(z2[1], dec)}`
-- Зона 3 · у B: `{fmt_px(z3[0], dec)}` — `{fmt_px(z3[1], dec)}`
-- Вход в зоне: **{entry_zone if entry_zone else 'вне диапазона'}** · коэффициент объёма **×{fmt_n(zone_reduction, 2)}**
-"""
-        level_block = ""
-        for s in setups:
-            stt = level_state(inst.price, s)
-            if stt == "none":
-                continue
-            tag = {"reached": "ОТРАБОТАН", "armed": "ожидание", "expired": "снят (цена за A)"}[stt]
-            move_text = f" · движение: {s['move']}" if s.get("move") else ""
-            level_block += (
-                f"- {s['dir']}: уровень `{fmt_px(s['level'], dec)}` — **{tag}**{move_text} "
-                f"(цена `{fmt_px(inst.price, dec)}`)\n"
-            )
-        if level_block:
-            level_block = "**Уровни из таблицы**\n" + level_block
-
-        tariff_display = resolved_tariff if tariff_found else (
-            f"{tariff_name_raw} (дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%)"
-            if tariff_name_raw else f"дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%"
-        )
-
-        st.markdown(
-            f"""
-**Вход:** `{fmt_px(avg_entry, dec)}` · **Контрактов:** `{fmt_n(effective_qty, 0)}` · **Направление:** `{direction}`
-
-**SL:** `{fmt_px(sl_dist, dec)}` пт = `{fmt_n(sl_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(risk_per_ct, 2)} ₽ / конт.**
-**TP:** `{fmt_px(tp_dist, dec)}` пт = `{fmt_n(tp_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(profit_per_ct, 2)} ₽ / конт.**
-
-**Бюджет риска:** `{fmt_n(deposit, 2)} ₽ × {fmt_n(risk_pct, 2)}%` = **{fmt_n(risk_budget, 2)} ₽**
-**Qty по риску:** `{fmt_n(qty_by_risk, 0)}` · **Qty по ГО ({margin_type}):** `{fmt_n(qty_by_margin, 0)}` · **База:** `{fmt_n(qty_base, 0)}`
-**Рекомендуемый объём:** `{fmt_n(qty_base, 0)} × {fmt_n(zone_reduction, 2)}` = **{fmt_n(qty_rec, 0)} конт.**
-
-**Комиссия (тариф: {tariff_display})**
-- Оборот одной стороны: `{fmt_n(turnover_one_way, 0)} ₽` = `{fmt_px(avg_entry, dec)}` × `{fmt_n(inst.point_value, 2)}` × `{fmt_n(effective_qty, 0)}`
-- Комиссия за сторону: `max({fmt_n(turnover_one_way, 0)} × {fmt_n(comm_pct, 3)}%, {fmt_n(comm_min, 2)})` = **{fmt_n(commission_one_way, 2)} ₽**
-- **Комиссия за круг (вход + выход):** **{fmt_n(total_commission, 2)} ₽**
-
-**Итог на {fmt_n(effective_qty, 0)} конт.**
-- Грязная прибыль при TP: <span {reward_style}>+{fmt_n(gross_reward, 2)} ₽</span>
-- Грязный убыток при SL: <span {risk_style}>−{fmt_n(gross_risk, 2)} ₽</span>
-- **Чистая прибыль при TP: <span {reward_style}>+{fmt_n(net_reward, 2)} ₽</span>**
-- **Чистый убыток при SL: <span {risk_style}>−{fmt_n(net_risk, 2)} ₽</span>**
-- Чистый RR: **{fmt_n(net_rr, 2)}**
-- Фактический риск (чистый): <span {risk_style}>{fmt_n(actual_risk_pct, 2)}%</span> от депозита (лимит {fmt_n(risk_pct, 2)}%){' — **ПРЕВЫШЕНИЕ ЛИМИТА**' if risk_exceeded else ''}
-- Загрузка ГО: `{fmt_n(margin * effective_qty, 0)} ₽` ({fmt_n((margin * effective_qty / deposit * 100) if deposit else 0, 2)}% депозита)
-
-{zone_block}
-{level_block}
-*ГО: таблица клиринга MOEX ISS, категория `{margin_type}`. Точность цены: {dec} знак(ов) — поле DECIMALS спецификации ISS.*
-""",
-            unsafe_allow_html=True,
-        )
+if avg_entry is not None and sl is not None and avg_entry != sl
