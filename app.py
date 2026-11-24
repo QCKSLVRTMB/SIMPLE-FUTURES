@@ -1,4 +1,4 @@
-# app.py — Калькулятор фьючерсов MOEX · монитор уровней и зон A/B · с учётом комиссий
+# app.py — Калькулятор фьючерсов MOEX · монитор уровней и зон A/B · с учётом комиссий · Захват ликвидности
 from __future__ import annotations
 
 import math
@@ -21,7 +21,6 @@ from requests.adapters import HTTPAdapter, Retry
 ISS = "https://iss.moex.com/iss/engines/futures/markets/forts"
 SHEET_ID = "1cHQnG1M7gQI5BpL9W0ijWgK-AI38NleQW_DOxccLDm0"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-# Отдельный URL для листа "Комиссии" (gviz/tq позволяет указать имя листа)
 COMMISSIONS_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq"
     f"?tqx=out:csv&sheet={quote('Комиссии')}"
@@ -49,6 +48,7 @@ TRADE_STATE_KEYS = [
     "entry_p_1", "entry_q_1",
     "entry_p_2", "entry_q_2",
     "point_a_input", "point_b_input",
+    "zl_input", "use_zl_mode",
 ]
 
 DIR_EMOJI = {"LONG": "🟩", "SHORT": "🟥"}
@@ -69,9 +69,14 @@ MOVE_CLASSES = {
 
 MOVE_RANK = {"Зигзаг": 0, "Тенденция": 1, "Волна": 2}
 
-# Дефолтная комиссия (если тариф не найден в таблице)
 DEFAULT_COMMISSION_PCT = 0.05
 DEFAULT_MIN_COMMISSION = 2.0
+
+# Прогрессия усреднения: каждая следующая точка = сумма предыдущих × 2
+# 1 точка: [1]
+# 2 точки: [1, 2]
+# 3 точки: [1, 2, 6]
+VOLUME_RATIO = {1: [1], 2: [1, 2], 3: [1, 2, 6]}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -209,7 +214,6 @@ def _norm(s) -> str:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_sheet_data() -> tuple[float, dict, dict, str]:
-    """Возвращает: (депозит, маппинг тикеров, мета, название тарифа из E1)."""
     deposit = 100_000.0
     tmap: dict[str, list[dict]] = {}
     meta = {"ok": False, "error": None, "rows": 0, "ts": time.time(),
@@ -227,13 +231,11 @@ def load_sheet_data() -> tuple[float, dict, dict, str]:
         meta["error"] = "таблица пуста"
         return deposit, tmap, meta, tariff_name
 
-    # Депозит — B1
     if raw.shape[1] > 1:
         v = parse_number(raw.iloc[0, 1])
         if v is not None and v > 0:
             deposit = v
 
-    # Резерв: слово «Депозит»
     if deposit == 100_000.0:
         for c in range(min(4, raw.shape[1])):
             hit = raw[raw[c].map(_norm).str.contains("депозит", na=False)]
@@ -243,7 +245,6 @@ def load_sheet_data() -> tuple[float, dict, dict, str]:
                     deposit = v
                     break
 
-    # Тариф из E1 (строка 0, столбец 4)
     if raw.shape[1] > 4:
         tariff_name = str(raw.iloc[0, 4]).strip()
         if tariff_name.lower() in {"nan", "none", ""}:
@@ -325,11 +326,6 @@ def load_sheet_data() -> tuple[float, dict, dict, str]:
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_commissions() -> tuple[dict, dict]:
-    """
-    Возвращает:
-      - tariff_book: dict[name] = {"broker": str, "pct": float, "min": float}
-      - meta: {"ok": bool, "error": str|None, "ts": float}
-    """
     book: dict[str, dict] = {}
     meta = {"ok": False, "error": None, "ts": time.time()}
 
@@ -343,7 +339,6 @@ def load_commissions() -> tuple[dict, dict]:
         meta["error"] = "лист «Комиссии» пуст или имеет меньше 3 колонок"
         return book, meta
 
-    # Нормализуем названия колонок
     cols = [str(c).strip().lower() for c in raw.columns]
 
     def find_col(*variants):
@@ -383,17 +378,11 @@ def load_commissions() -> tuple[dict, dict]:
 
 
 def resolve_commission(tariff_name: str, book: dict) -> tuple[float, float, str, bool]:
-    """
-    Возвращает (pct, min_commission, resolved_name, found).
-    Если тариф не найден — возвращает дефолтные значения.
-    """
     if not tariff_name:
         return DEFAULT_COMMISSION_PCT, DEFAULT_MIN_COMMISSION, "", False
-    # Точное совпадение
     if tariff_name in book:
         rec = book[tariff_name]
         return rec["pct"], rec["min"], tariff_name, True
-    # Нечувствительное к регистру
     key = tariff_name.lower()
     for name, rec in book.items():
         if name.lower() == key:
@@ -402,7 +391,6 @@ def resolve_commission(tariff_name: str, book: dict) -> tuple[float, float, str,
 
 
 def calc_commission(turnover: float, pct: float, min_comm: float) -> float:
-    """Комиссия за одну сторону сделки."""
     if turnover <= 0:
         return 0.0
     return max(turnover * pct / 100.0, min_comm)
@@ -411,17 +399,13 @@ def calc_commission(turnover: float, pct: float, min_comm: float) -> float:
 # ─────────────────────────────────────────────────────────────
 # MOEX ISS
 # ─────────────────────────────────────────────────────────────
-# Отключаем предупреждение о небезопасном запросе, чтобы не засорять консоль
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @st.cache_resource(show_spinner=False)
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "moex-futures-desk/15.0"})
-    
-    # ИСПРАВЛЕНИЕ: отключаем строгую проверку SSL-сертификатов для обхода ошибок MOEX ISS
-    s.verify = False 
-    
+    s.verify = False
     s.mount(
         "https://",
         HTTPAdapter(
@@ -711,6 +695,7 @@ st.markdown(
   --short:#E02424; --short-deep:#B01B1B; --short-soft:#FDE7E7;
   --warn:#C2740A; --warn-soft:#FDF1D8;
   --info:#1D4ED8; --info-soft:#E3E9FE;
+  --zl:#7C3AED; --zl-soft:#F3E8FF;
   --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
 }
 html,body,[class*="css"]{
@@ -873,6 +858,7 @@ div[data-testid="stNumberInput"] input{font-family:var(--mono);font-variant-nume
 .chip.bad{background:var(--short-soft);border-color:#EFB3B3;color:var(--short-deep);}
 .chip.warn{background:var(--warn-soft);border-color:#EBC98A;color:#8A5308;}
 .chip.info{background:var(--info-soft);border-color:#B9C6F7;color:#1E3A8A;}
+.chip.zl{background:var(--zl-soft);border-color:#C4B5FD;color:#5B21B6;}
 .chip.mini{font-size:.62rem;padding:2px 8px;}
 
 section[data-testid="stSidebar"]{background:linear-gradient(180deg,#FFFFFF 0%,#F5F8FD 100%);
@@ -1277,6 +1263,27 @@ with st.sidebar:
         placeholder="Точка B", key="point_b_input",
     )
 
+    # ── РЕЖИМ ЗАХВАТА ЛИКВИДНОСТИ ──
+    st.divider()
+    use_zl_mode = st.checkbox(
+        "🎯 Режим: Захват ликвидности (ЗЛ)",
+        key="use_zl_mode",
+        help="Цена ныряет за точку А и возвращается. Усреднение с увеличением объёма.",
+    )
+
+    zl_price = None
+    if use_zl_mode:
+        zl_price = st.number_input(
+            "Уровень ЗЛ (Захвата ликвидности)",
+            value=None, step=step_ui, format=fmt_in,
+            placeholder="Цена захвата ликвидности",
+            key="zl_input",
+        )
+        st.caption(
+            "Для LONG: ЗЛ ниже точки А, SL ниже ЗЛ.\n"
+            "Для SHORT: ЗЛ выше точки А, SL выше ЗЛ."
+        )
+
     st.markdown('<div class="lbl">Справка из таблицы</div>', unsafe_allow_html=True)
     if setups:
         ref = []
@@ -1385,9 +1392,9 @@ ladder = (zone_ladder_html(cur_info, inst.price, cur_level, cur_lvl_state, dec)
           'Задайте A и B<br>в боковом меню</span></div>')
 
 if cur_zone:
-    zt, zl = ZONE_LABEL[cur_zone]
+    zt, zl_text = ZONE_LABEL[cur_zone]
     zcard = (f'<div class="zone-card z{cur_zone}"><span class="zn">{ZONE_EMOJI[cur_zone]} {zt}</span>'
-             f'<span class="zl">{zl} · цена {fmt_px(inst.price, dec)}</span></div>')
+             f'<span class="zl">{zl_text} · цена {fmt_px(inst.price, dec)}</span></div>')
 elif cur_info:
     if cur_info.get("outside") == "below":
         side = "ниже A" if cur_info["dir"] == "LONG" else "выше A"
@@ -1581,3 +1588,302 @@ if avg_entry is not None and sl is not None and avg_entry != sl:
         f'<span class="chip">риск {fmt_px(risk_pts, dec)} пт</span></div>',
         unsafe_allow_html=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# ВАЛИДАЦИЯ
+# ─────────────────────────────────────────────────────────────
+have_prices = avg_entry is not None and sl is not None and tp is not None
+have_qty = effective_qty > 0
+warnings: list[str] = []
+
+if have_prices:
+    if direction == "LONG":
+        if sl >= avg_entry:
+            warnings.append("LONG: стоп-лосс должен быть ниже средней цены входа.")
+        if tp <= avg_entry:
+            warnings.append("LONG: тейк-профит должен быть выше средней цены входа.")
+    else:
+        if sl <= avg_entry:
+            warnings.append("SHORT: стоп-лосс должен быть выше средней цены входа.")
+        if tp >= avg_entry:
+            warnings.append("SHORT: тейк-профит должен быть ниже средней цены входа.")
+
+# Валидация Захвата Ликвидности (ЗЛ)
+zl_valid = True
+if use_zl_mode and zl_price is not None and point_a is not None:
+    if direction == "LONG":
+        if zl_price >= point_a:
+            zl_valid = False
+            warnings.append("ЗЛ: для LONG уровень захвата ликвидности должен быть НИЖЕ точки A.")
+        elif sl is not None and sl >= zl_price:
+            zl_valid = False
+            warnings.append("ЗЛ: для LONG стоп-лосс (SL) должен быть НИЖЕ уровня захвата ликвидности.")
+    else:  # SHORT
+        if zl_price <= point_a:
+            zl_valid = False
+            warnings.append("ЗЛ: для SHORT уровень захвата ликвидности должен быть ВЫШЕ точки A.")
+        elif sl is not None and sl <= zl_price:
+            zl_valid = False
+            warnings.append("ЗЛ: для SHORT стоп-лосс (SL) должен быть ВЫШЕ уровня захвата ликвидности.")
+
+entry_zone, entry_info = (determine_zone(avg_entry, point_a, point_b) if manual_ab else (None, None))
+zone_blocked, zone_reduction, zone_message = False, 1.0, None
+
+# ИСПРАВЛЕННАЯ ЛОГИКА ЗОН:
+# Зона 1 (у точки A) — оптимальна для обоих направлений
+# Зона 2 (середина) — повышенный риск, сокращение на 50%
+# Зона 3 (у точки B) — запрещена для обоих направлений
+if manual_ab and entry_zone is not None:
+    if entry_zone == 3:
+        zone_blocked = True
+        zone_message = f"ЗАПРЕЩЕНО: вход в зоне 3 (у точки B) для {direction}. Высокий риск."
+    elif entry_zone == 2:
+        zone_reduction = 0.5
+        zone_message = "Зона 2: повышенный риск — рекомендуемый объём сокращён на 50%."
+    else:
+        zone_message = f"Зона {entry_zone}: оптимальная для {direction}."
+
+for w in warnings:
+    st.warning(w)
+
+if zone_message:
+    cls = "bad" if zone_blocked else ("warn" if zone_reduction < 1 else "ok")
+    st.markdown(
+        f'<div class="chips"><span class="chip {cls}">вход · {ZONE_EMOJI.get(entry_zone, "▫️")} '
+        f'{zone_message}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# РАСЧЁТ КОМИССИЙ
+# ─────────────────────────────────────────────────────────────
+turnover_one_way = (avg_entry or 0.0) * inst.point_value * effective_qty
+commission_one_way = calc_commission(turnover_one_way, comm_pct, comm_min)
+total_commission = commission_one_way * 2.0
+
+
+# ─────────────────────────────────────────────────────────────
+# РЕЗУЛЬТАТ
+# ─────────────────────────────────────────────────────────────
+if zone_blocked:
+    st.error(zone_message)
+elif not have_prices:
+    st.markdown(
+        '<div class="chips"><span class="chip">Заполните вход, SL и TP для расчёта</span></div>',
+        unsafe_allow_html=True,
+    )
+elif not have_qty:
+    sl_dist = abs(avg_entry - sl)
+    tp_dist = abs(tp - avg_entry)
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+    st.markdown(
+        f'<div class="strip tint"><div class="cell"><span class="k">Расчётный RR</span>'
+        f'<span class="v">{fmt_n(rr, 2)}</span></div>'
+        f'<div class="cell"><span class="k">Средний вход</span>'
+        f'<span class="v">{fmt_px(avg_entry, dec)}</span></div></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Укажите количество контрактов — появится сайзинг и проверка MM.")
+else:
+    sl_dist = abs(avg_entry - sl)
+    tp_dist = abs(tp - avg_entry)
+    sl_steps = sl_dist / inst.min_step
+    tp_steps = tp_dist / inst.min_step
+    risk_per_ct = sl_steps * inst.step_price
+    profit_per_ct = tp_steps * inst.step_price
+
+    margin = inst.margin(direction)
+    risk_budget = deposit * risk_pct / 100
+    qty_by_risk = int(risk_budget // risk_per_ct) if risk_per_ct > 0 else 0
+    qty_by_margin = int((deposit * margin_util / 100) // margin) if margin > 0 else 0
+    qty_base = min(qty_by_risk, qty_by_margin)
+    qty_rec = int(qty_base * zone_reduction)
+
+    gross_risk = risk_per_ct * effective_qty
+    gross_reward = profit_per_ct * effective_qty
+
+    net_risk = gross_risk + total_commission
+    net_reward = max(gross_reward - total_commission, 0.0)
+    net_rr = (net_reward / net_risk) if net_risk > 0 else 0.0
+
+    actual_risk_pct = (net_risk / deposit * 100) if deposit else 0.0
+
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+    rr_ok = rr >= required_rr and sl_dist > 0 and tp_dist > 0
+    mm_ok = effective_qty <= qty_rec and not warnings and effective_qty > 0
+    risk_exceeded = actual_risk_pct > risk_pct + 1e-9
+
+    # ─────────────────────────────────────────────────────────────
+    # УНИВЕРСАЛЬНАЯ ЛОГИКА РАСПРЕДЕЛЕНИЯ ОБЪЁМА (прогрессия 1-2-6)
+    # ─────────────────────────────────────────────────────────────
+    # Определяем количество активных точек входа (с введённой ценой)
+    active_entry_points = sum(1 for e in entries if e["price"] is not None)
+    active_entry_points = max(1, min(3, active_entry_points))
+
+    # Выбираем прогрессию в зависимости от количества точек
+    ratio = VOLUME_RATIO[active_entry_points]
+    ratio_sum = sum(ratio)
+
+    # Рассчитываем рекомендуемое распределение от qty_rec
+    base_lots = max(1, qty_rec // ratio_sum)
+    rec_qtys = [base_lots * r for r in ratio]
+    # Дополняем до 3 элементов для единообразия отображения
+    while len(rec_qtys) < 3:
+        rec_qtys.append(0)
+
+    rec_total = sum(rec_qtys)
+
+    # В режиме ЗЛ автоподставляем цену ЗЛ во вторую точку, если она пуста
+    if use_zl_mode and zl_valid and zl_price is not None:
+        if st.session_state.get("entry_p_1") is None:
+            st.session_state["entry_p_1"] = float(zl_price)
+
+    # Вывод рекомендации по распределению объёма
+    if qty_rec > 0:
+        entry_labels = ["Твх 1 (у точки А)"]
+        if active_entry_points >= 2:
+            entry_labels.append("Твх 2 (на уровне ЗЛ)" if use_zl_mode else "Твх 2 (усреднение)")
+        if active_entry_points >= 3:
+            entry_labels.append("Твх 3 (глубокое усреднение)")
+
+        chips_parts = []
+        for i, (label, qty) in enumerate(zip(entry_labels, rec_qtys[:active_entry_points])):
+            chips_parts.append(
+                f'<span style="background: #fff; padding: 4px 8px; border-radius: 4px; '
+                f'border: 1px solid #EBC98A; white-space: nowrap;">'
+                f'<b>{label}:</b> {qty} конт.'
+                f'</span>'
+            )
+        chips_parts.append(
+            f'<span style="background: #E3E9FE; padding: 4px 8px; border-radius: 4px; '
+            f'border: 1px solid #B9C6F7; color: #1E3A8A; white-space: nowrap;">'
+            f'<b>Итого в серии:</b> {rec_total} из {qty_rec} допустимых'
+            f'</span>'
+        )
+
+        mode_label = "🎯 ЗАХВАТ ЛИКВИДНОСТИ" if use_zl_mode else "📊 УСРЕДНЕНИЕ"
+        ratio_str = " / ".join(str(r) for r in ratio)
+
+        st.markdown(
+            f"""
+            <div style="background: var(--zl-soft); border: 1px solid #C4B5FD; border-radius: 8px; padding: 10px; margin: 10px 0;">
+                <div style="font-size: 0.75rem; font-weight: 700; color: #5B21B6; margin-bottom: 6px; font-family: var(--mono);">
+                    {mode_label} · прогрессия [{ratio_str}]
+                </div>
+                <div style="display: flex; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 0.8rem;">
+                    {"".join(chips_parts)}
+                </div>
+                <div style="font-size: 0.65rem; color: #7C3AED; margin-top: 6px; font-style: italic;">
+                    * Вы можете вручную изменить количество контрактов в полях выше. Калькулятор пересчитает среднюю цену и риск.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f"""
+<div class="strip tint">
+  <div class="cell"><span class="k">RR (грязный)</span><span class="v" style="color:{'#046C4E' if rr_ok else '#B01B1B'}">{fmt_n(rr, 2)}</span></div>
+  <div class="cell"><span class="k">RR (чистый)</span><span class="v" style="color:{'#046C4E' if net_rr >= required_rr else '#B01B1B'}">{fmt_n(net_rr, 2)}</span></div>
+  <div class="cell"><span class="k">Реком. объём</span><span class="v" style="color:#1E3A8A">{fmt_n(qty_rec, 0)}</span></div>
+</div>
+<div class="chips">
+  <span class="chip info">комиссия за круг: {fmt_n(total_commission, 2)} ₽</span>
+  <span class="chip {'ok' if rr_ok else 'bad'}">грязный RR {fmt_n(rr, 2)} {'≥' if rr_ok else '&lt;'} {fmt_n(required_rr, 2)}</span>
+  <span class="chip {'ok' if net_rr >= required_rr else 'bad'}">чистый RR {fmt_n(net_rr, 2)} {'≥' if net_rr >= required_rr else '&lt;'} {fmt_n(required_rr, 2)}</span>
+  <span class="chip {'ok' if mm_ok else 'bad'}">MM {fmt_n(effective_qty, 0)} {'≤' if mm_ok else '&gt;'} {fmt_n(qty_rec, 0)}</span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    if warnings:
+        st.error("Некорректные цены сделки — исправьте уровни выше.")
+    elif not mm_ok:
+        st.error(f"Объём {fmt_n(effective_qty, 0)} конт. превышает рекомендуемые {fmt_n(qty_rec, 0)}.")
+    elif not rr_ok:
+        ratio_rr = rr / required_rr if required_rr else 0
+        safe_qty = int(math.floor(qty_rec * ratio_rr))
+        if safe_qty < 1:
+            st.warning("RR слишком низкий — сделку рекомендуется пропустить.")
+        elif effective_qty <= safe_qty:
+            st.info(f"RR ниже плана, но объём {fmt_n(effective_qty, 0)} ≤ безопасного {fmt_n(safe_qty, 0)}.")
+        else:
+            st.warning(
+                f"Сократите позицию до {fmt_n(safe_qty, 0)} конт. — "
+                f"риск снизится до {fmt_n(risk_per_ct * safe_qty, 2)} ₽."
+            )
+
+    with st.expander("Детали расчёта", expanded=False):
+        risk_style = 'style="color:#B01B1B;font-weight:700"' if risk_exceeded else ""
+        reward_style = 'style="color:#046C4E;font-weight:700"'
+        zone_block = ""
+        if manual_ab and entry_info:
+            z1 = sorted([point_a, entry_info["p1"]])
+            z2 = sorted([entry_info["p1"], entry_info["p2"]])
+            z3 = sorted([entry_info["p2"], point_b])
+            zone_block = f"""
+**Зоны A-B (введённые значения)**
+- Зона 1 · у A: `{fmt_px(z1[0], dec)}` — `{fmt_px(z1[1], dec)}`
+- Зона 2 · середина: `{fmt_px(z2[0], dec)}` — `{fmt_px(z2[1], dec)}`
+- Зона 3 · у B: `{fmt_px(z3[0], dec)}` — `{fmt_px(z3[1], dec)}`
+- Вход в зоне: **{entry_zone if entry_zone else 'вне диапазона'}** · коэффициент объёма **×{fmt_n(zone_reduction, 2)}**
+"""
+        level_block = ""
+        for s in setups:
+            stt = level_state(inst.price, s)
+            if stt == "none":
+                continue
+            tag = {"reached": "ОТРАБОТАН", "armed": "ожидание", "expired": "снят (цена за A)"}[stt]
+            move_text = f" · движение: {s['move']}" if s.get("move") else ""
+            level_block += (
+                f"- {s['dir']}: уровень `{fmt_px(s['level'], dec)}` — **{tag}**{move_text} "
+                f"(цена `{fmt_px(inst.price, dec)}`)\n"
+            )
+        if level_block:
+            level_block = "**Уровни из таблицы**\n" + level_block
+
+        tariff_display = resolved_tariff if tariff_found else (
+            f"{tariff_name_raw} (дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%)"
+            if tariff_name_raw else f"дефолт {fmt_n(DEFAULT_COMMISSION_PCT, 3)}%"
+        )
+
+        zl_block = ""
+        if use_zl_mode and zl_price is not None:
+            zl_block = f"**Захват ликвидности:** уровень ЗЛ = `{fmt_px(zl_price, dec)}`\n"
+
+        st.markdown(
+            f"""
+**Вход:** `{fmt_px(avg_entry, dec)}` · **Контрактов:** `{fmt_n(effective_qty, 0)}` · **Направление:** `{direction}`
+
+**SL:** `{fmt_px(sl_dist, dec)}` пт = `{fmt_n(sl_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(risk_per_ct, 2)} ₽ / конт.**
+**TP:** `{fmt_px(tp_dist, dec)}` пт = `{fmt_n(tp_steps, 2)}` шагов × `{fmt_n(inst.step_price, 2)}` ₽ = **{fmt_n(profit_per_ct, 2)} ₽ / конт.**
+
+**Бюджет риска:** `{fmt_n(deposit, 2)} ₽ × {fmt_n(risk_pct, 2)}%` = **{fmt_n(risk_budget, 2)} ₽**
+**Qty по риску:** `{fmt_n(qty_by_risk, 0)}` · **Qty по ГО ({margin_type}):** `{fmt_n(qty_by_margin, 0)}` · **База:** `{fmt_n(qty_base, 0)}`
+**Рекомендуемый объём:** `{fmt_n(qty_base, 0)} × {fmt_n(zone_reduction, 2)}` = **{fmt_n(qty_rec, 0)} конт.**
+
+**Комиссия (тариф: {tariff_display})**
+- Оборот одной стороны: `{fmt_n(turnover_one_way, 0)} ₽` = `{fmt_px(avg_entry, dec)}` × `{fmt_n(inst.point_value, 2)}` × `{fmt_n(effective_qty, 0)}`
+- Комиссия за сторону: `max({fmt_n(turnover_one_way, 0)} × {fmt_n(comm_pct, 3)}%, {fmt_n(comm_min, 2)})` = **{fmt_n(commission_one_way, 2)} ₽**
+- **Комиссия за круг (вход + выход):** **{fmt_n(total_commission, 2)} ₽**
+
+**Итог на {fmt_n(effective_qty, 0)} конт.**
+- Грязная прибыль при TP: <span {reward_style}>+{fmt_n(gross_reward, 2)} ₽</span>
+- Грязный убыток при SL: <span {risk_style}>−{fmt_n(gross_risk, 2)} ₽</span>
+- **Чистая прибыль при TP: <span {reward_style}>+{fmt_n(net_reward, 2)} ₽</span>**
+- **Чистый убыток при SL: <span {risk_style}>−{fmt_n(net_risk, 2)} ₽</span>**
+- Чистый RR: **{fmt_n(net_rr, 2)}**
+- Фактический риск (чистый): <span {risk_style}>{fmt_n(actual_risk_pct, 2)}%</span> от депозита (лимит {fmt_n(risk_pct, 2)}%){' — **ПРЕВЫШЕНИЕ ЛИМИТА**' if risk_exceeded else ''}
+- Загрузка ГО: `{fmt_n(margin * effective_qty, 0)} ₽` ({fmt_n((margin * effective_qty / deposit * 100) if deposit else 0, 2)}% депозита)
+
+{zl_block}
+{zone_block}
+{level_block}
+*ГО: таблица клиринга MOEX ISS, категория `{margin_type}`. Точность цены: {dec} знак(ов) — поле DECIMALS спецификации ISS.*
+""",
+            unsafe_allow_html=True,
+        )
