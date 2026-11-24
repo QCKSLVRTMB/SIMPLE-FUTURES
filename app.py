@@ -1763,7 +1763,7 @@ else:
             f'</span>'
         )
 
-        mode_label = "🎯 ЗАХВАТ ЛИКВИДНОСТИ" if use_zl_mode else "📊 УСРЕДНЕНИЕ"
+        mode_label = "ЗАХВАТ ЛИКВИДНОСТИ" if use_zl_mode else "УСРЕДНЕНИЕ"
         ratio_str = " / ".join(str(r) for r in ratio)
 
         st.markdown(
