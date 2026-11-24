@@ -1572,4 +1572,12 @@ else:
     qty_sum = 0
 effective_qty = qty_sum
 
-if avg_entry is not None and sl is not None and avg_entry != sl
+if avg_entry is not None and sl is not None and avg_entry != sl:
+    risk_pts = abs(avg_entry - sl)
+    min_tp = inst.round_price(avg_entry + sign * risk_pts * required_rr)
+    st.markdown(
+        f'<div class="chips"><span class="chip info">мин. TP для RR {fmt_n(required_rr, 2)} → '
+        f'{fmt_px(min_tp, dec)}</span>'
+        f'<span class="chip">риск {fmt_px(risk_pts, dec)} пт</span></div>',
+        unsafe_allow_html=True,
+    )
