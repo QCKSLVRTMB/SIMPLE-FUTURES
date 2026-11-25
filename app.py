@@ -1024,7 +1024,7 @@ with st.sidebar:
     point_b = st.number_input("Точка B", value=None, step=step_ui, format=fmt_in, placeholder="Точка B", key="point_b_input")
 
     st.divider()
-    use_zl_mode = st.checkbox("🎯 Режим: Захват ликвидности (ЗЛ)", key="use_zl_mode", help="Цена ныряет за точку А и возвращается. Усреднение с увеличением объёма.")
+    use_zl_mode = st.checkbox("Захват ликвидности (ЗЛ)", key="use_zl_mode", help="Цена ныряет за точку А и возвращается. Усреднение с увеличением объёма.")
     zl_price = None
     if use_zl_mode:
         zl_price = st.number_input("Уровень ЗЛ (Захвата ликвидности)", value=None, step=step_ui, format=fmt_in, placeholder="Цена захвата ликвидности", key="zl_input")
@@ -1422,7 +1422,7 @@ else:
             chips_parts.append(f'<span style="background: #fff; padding: 4px 8px; border-radius: 4px; border: 1px solid #EBC98A; white-space: nowrap;"><b>{label}:</b> {qty} конт.</span>')
         chips_parts.append(f'<span style="background: #E3E9FE; padding: 4px 8px; border-radius: 4px; border: 1px solid #B9C6F7; color: #1E3A8A; white-space: nowrap;"><b>Итого в серии:</b> {rec_total} из {qty_rec} допустимых</span>')
 
-        mode_label = "🎯 ЗАХВАТ ЛИКВИДНОСТИ" if use_zl_mode else "📊 УСРЕДНЕНИЕ"
+        mode_label = "ЗАХВАТ ЛИКВИДНОСТИ" if use_zl_mode else "УСРЕДНЕНИЕ"
         ratio_str = " / ".join(str(r) for r in ratio)
 
         st.markdown(
